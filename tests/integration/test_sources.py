@@ -8,6 +8,8 @@ from pathlib import Path
 from unittest.mock import Mock
 from urllib.error import HTTPError
 
+import pytest
+
 from gtts.data.calendar import TradingCalendar
 from gtts.data.ingest import ingest_daily
 from gtts.data.schema import TAIPEI
@@ -91,6 +93,31 @@ def test_refresh_preserves_revisions_and_first_seen_timestamp(tmp_path: Path) ->
     with closing(sqlite3.connect(database)) as db:
         assert db.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0] == 2
         assert db.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 2
+
+
+@pytest.mark.parametrize("bad_payload, kind", [(b"[]", "missing"), (b"<html>", "invalid")])
+def test_refresh_with_gaps_keeps_complete_cached_snapshot(
+    tmp_path: Path, bad_payload: bytes, kind: str
+) -> None:
+    database = tmp_path / "ingest.sqlite"
+    adapter = TwseIndex()
+    fetch = Mock(side_effect=[(fixture(adapter.source_id), None), (bad_payload, None)])
+    first = ingest_daily(
+        TRADE_DATE, calendar(), [adapter], database, fetch=fetch, now=lambda: FETCHED
+    )
+    failed = ingest_daily(TRADE_DATE, calendar(), [adapter], database, fetch=fetch, refresh=True)
+    assert failed.records == []
+    assert [gap.kind for gap in failed.gaps] == [kind]
+    assert ingest_daily(TRADE_DATE, calendar(), [adapter], database, fetch=fetch) == first
+    assert fetch.call_count == 2
+    with closing(sqlite3.connect(database)) as db:
+        assert db.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0] == 2
+        assert db.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 2
+        with db:
+            # Older databases could point at a response that contained gaps.
+            db.execute("UPDATE current_snapshots SET checksum=?", (sha256(bad_payload).hexdigest(),))
+    assert ingest_daily(TRADE_DATE, calendar(), [adapter], database, fetch=fetch) == first
+    assert fetch.call_count == 2
 
 
 def test_timeout_retries_and_nontransient_http_error_does_not() -> None:

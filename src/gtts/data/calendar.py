@@ -161,6 +161,27 @@ class TradingCalendar(Schema):
             return None
         return self.last_trade_date(instrument, contract_month)
 
+    def _has_listed(self, instrument: str, contract_month: str | None, day: date) -> bool:
+        if contract_month is None or instrument not in {"TX", "MTX"}:
+            return True
+        expiry = self._nominal_expiry(instrument, contract_month)
+        if "W" in contract_month:
+            return day >= expiry - timedelta(weeks=2)
+
+        # The third near month rolls after three months; the farthest quarterly rolls yearly.
+        months_since_listing = 12 if expiry.month % 3 == 0 else 3
+        year, month = divmod(expiry.year * 12 + expiry.month - 1 - months_since_listing, 12)
+        previous_month = f"{year:04}{month + 1:02}"
+        replacement = self.expiry_overrides.get(instrument, {}).get(previous_month)
+        if replacement is not None:
+            return day > replacement
+        previous_expiry = self._nominal_expiry(instrument, previous_month)
+        if previous_expiry >= day:
+            return False
+        if previous_expiry < self.covered_from:
+            return True
+        return day > self.last_trade_date(instrument, previous_month)
+
     def day_session(
         self, instrument: str, trade_date: date, contract_month: str | None = None
     ) -> Session | None:
@@ -168,7 +189,9 @@ class TradingCalendar(Schema):
         if not self.is_trade_date(trade_date):
             return None
         expiry = self._expiry_as_of(instrument, contract_month, trade_date)
-        if expiry is not None and trade_date > expiry:
+        if (expiry is not None and trade_date > expiry) or not self._has_listed(
+            instrument, contract_month, trade_date
+        ):
             return None
         close = spec.expiry_close if trade_date == expiry else spec.day_close
         return Session(
@@ -188,7 +211,11 @@ class TradingCalendar(Schema):
             return None
         opens_on = self.previous_trade_date(trade_date)
         expiry = self._expiry_as_of(instrument, contract_month, opens_on)
-        if opens_on in self.cancelled_night_starts or (expiry is not None and opens_on >= expiry):
+        if (
+            opens_on in self.cancelled_night_starts
+            or (expiry is not None and opens_on >= expiry)
+            or not self._has_listed(instrument, contract_month, opens_on)
+        ):
             return None
         return Session(
             "night",

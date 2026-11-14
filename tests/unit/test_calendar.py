@@ -42,6 +42,27 @@ def test_expiry_applies_to_exact_contract(calendar: TradingCalendar) -> None:
         calendar.last_trade_date("TX", "202602W2")
 
 
+@pytest.mark.parametrize(
+    "instrument, contract_month, listing_date",
+    [
+        ("MTX", "202603W1", date(2026, 2, 23)),
+        ("TX", "202605", date(2026, 2, 24)),
+        ("MTX", "202605", date(2026, 2, 24)),
+        ("TX", "202709", date(2026, 9, 17)),
+    ],
+)
+def test_contract_first_trades_during_day_session(
+    calendar: TradingCalendar, instrument: str, contract_month: str, listing_date: date
+) -> None:
+    before = calendar.previous_trade_date(listing_date)
+    after = calendar.next_trade_date(listing_date)
+    assert calendar.day_session(instrument, before, contract_month) is None
+    assert calendar.night_session(instrument, listing_date, contract_month) is None
+    assert calendar.day_session(instrument, listing_date, contract_month) is not None
+    first_night = calendar.night_session(instrument, after, contract_month)
+    assert first_night and first_night.opens_at.date() == listing_date
+
+
 def test_calendar_override_and_effective_dates_are_data_driven(calendar: TradingCalendar) -> None:
     values = calendar.model_dump()
     changed = values["contracts"]["TX"][0] | {

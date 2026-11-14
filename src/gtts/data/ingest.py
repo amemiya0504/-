@@ -105,7 +105,7 @@ def ingest_daily(
     refresh: bool = False,
     now: Callable[[], datetime] = lambda: datetime.now(TAIPEI),
 ) -> IngestResult:
-    """Use the last stored snapshot per endpoint/date unless refresh is requested."""
+    """Reuse the last complete snapshot per endpoint/date unless refresh is requested."""
     if not isfinite(timeout) or timeout <= 0 or attempts < 1:
         raise ValueError("timeout and attempts must be positive")
     try:
@@ -157,11 +157,15 @@ def _ingest_source(
     key = (adapter.source_id, endpoint_key, trade_date.isoformat())
     row = db.execute(
         "SELECT checksum, payload, ingested_at, source_revision "
-        "FROM current_snapshots JOIN snapshots USING (source_id, endpoint_key, trade_date, checksum) "
-        "WHERE source_id=? AND endpoint_key=? AND trade_date=?",
-        key,
+        "FROM snapshots JOIN observations USING (source_id, endpoint_key, trade_date, checksum) "
+        "LEFT JOIN current_snapshots USING (source_id, endpoint_key, trade_date, checksum) "
+        "WHERE snapshots.source_id=? AND snapshots.endpoint_key=? AND snapshots.trade_date=? "
+        "AND gaps_json=? ORDER BY current_snapshots.checksum IS NOT NULL DESC, ingested_at DESC "
+        "LIMIT 1",
+        (*key, b"[]"),
     ).fetchone()
-    if row is None or refresh:
+    fetched = row is None or refresh
+    if fetched:
         try:
             payload, revision = _fetch_with_retry(fetch, adapter.endpoint, timeout, attempts)
         except (OSError, http.client.HTTPException, ValueError) as error:
@@ -180,7 +184,9 @@ def _ingest_source(
         ingested_at = now()
         if ingested_at.utcoffset() is None:
             raise ValueError("ingest clock must return a timezone-aware datetime")
-        with db:
+
+    with db:
+        if fetched:
             db.execute(
                 "INSERT INTO snapshots VALUES (?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT (source_id, endpoint_key, trade_date, checksum) DO UPDATE SET "
@@ -192,53 +198,53 @@ def _ingest_source(
                 "WHERE source_id=? AND endpoint_key=? AND trade_date=? AND checksum=?",
                 (*key, checksum),
             ).fetchone()
-            db.execute(
-                "INSERT INTO current_snapshots VALUES (?, ?, ?, ?) "
-                "ON CONFLICT (source_id, endpoint_key, trade_date) DO UPDATE SET "
-                "checksum=excluded.checksum",
-                (*key, checksum),
+        try:
+            snapshot = _snapshot_from_row(trade_date, row)
+        except (TypeError, ValueError) as error:
+            return IngestResult(
+                [],
+                [
+                    Gap(
+                        source_id=adapter.source_id,
+                        trade_date=trade_date,
+                        kind="cache",
+                        detail=str(error),
+                    )
+                ],
             )
-    try:
-        snapshot = _snapshot_from_row(trade_date, row)
-    except (TypeError, ValueError) as error:
-        return IngestResult(
-            [],
-            [
+        try:
+            records, gaps = adapter.parse(snapshot, calendar)
+        except CalendarGap as error:
+            records = []
+            gaps = [
                 Gap(
                     source_id=adapter.source_id,
                     trade_date=trade_date,
-                    kind="cache",
+                    kind="calendar",
                     detail=str(error),
                 )
-            ],
-        )
-    try:
-        records, gaps = adapter.parse(snapshot, calendar)
-    except CalendarGap as error:
-        records = []
-        gaps = [
-            Gap(
-                source_id=adapter.source_id,
-                trade_date=trade_date,
-                kind="calendar",
-                detail=str(error),
-            )
-        ]
-    except (TypeError, ValueError) as error:
-        records = []
-        gaps = [
-            Gap(
-                source_id=adapter.source_id,
-                trade_date=trade_date,
-                kind="invalid",
-                detail=str(error),
-            )
-        ]
-    with db:
+            ]
+        except (TypeError, ValueError) as error:
+            records = []
+            gaps = [
+                Gap(
+                    source_id=adapter.source_id,
+                    trade_date=trade_date,
+                    kind="invalid",
+                    detail=str(error),
+                )
+            ]
         db.execute(
             "INSERT INTO observations VALUES (?, ?, ?, ?, ?, ?) "
             "ON CONFLICT (source_id, endpoint_key, trade_date, checksum) DO UPDATE SET "
             "records_json=excluded.records_json, gaps_json=excluded.gaps_json",
             (*key, snapshot.checksum, _RECORDS.dump_json(records), _GAPS.dump_json(gaps)),
         )
+        if fetched and not gaps:
+            db.execute(
+                "INSERT INTO current_snapshots VALUES (?, ?, ?, ?) "
+                "ON CONFLICT (source_id, endpoint_key, trade_date) DO UPDATE SET "
+                "checksum=excluded.checksum",
+                (*key, snapshot.checksum),
+            )
     return IngestResult(records, gaps)
