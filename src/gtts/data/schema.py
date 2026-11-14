@@ -39,11 +39,19 @@ class MarketEvent(Schema):
         return _taipei_datetime(value) if value is not None else None
 
     @model_validator(mode="after")
-    def availability_is_not_before_event(self) -> "MarketEvent":
+    def timestamps_are_in_order(self) -> "MarketEvent":
         if self.available_at < self.event_at:
             raise ValueError("available_at must be at or after event_at")
-        if self.published_at is not None and self.available_at < self.published_at:
-            raise ValueError("available_at must be at or after published_at")
+        if self.ingested_at < self.event_at:
+            raise ValueError("ingested_at must be at or after event_at")
+        if self.published_at is None:
+            if self.available_at < self.ingested_at:
+                raise ValueError("available_at must be at or after ingested_at without published_at")
+        else:
+            if not self.event_at <= self.published_at <= self.ingested_at:
+                raise ValueError("published_at must be between event_at and ingested_at")
+            if self.available_at < self.published_at:
+                raise ValueError("available_at must be at or after published_at")
         return self
 
 

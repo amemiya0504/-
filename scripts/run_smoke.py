@@ -12,7 +12,7 @@ event = MarketEvent(
     event_at=datetime(2026, 11, 13, 9, 0, tzinfo=TAIPEI),
     published_at=None,
     ingested_at=datetime(2026, 11, 13, 9, 1, tzinfo=TAIPEI),
-    available_at=datetime(2026, 11, 13, 9, 0, tzinfo=TAIPEI),
+    available_at=datetime(2026, 11, 13, 9, 1, tzinfo=TAIPEI),
     source_revision="synthetic-v1",
     checksum="offline-only",
 )

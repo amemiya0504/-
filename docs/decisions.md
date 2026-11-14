@@ -10,7 +10,7 @@
 ## ADR-0002：時間欄位與可得時間
 
 - 狀態：已採用
-- 決策：事件時間使用 timezone-aware `datetime`，明示 `Asia/Taipei`。市場資料事件須有 `event_at`、`ingested_at`、`available_at`，可缺 `published_at`；`available_at` 不得早於 `event_at`。
+- 決策：事件時間使用 timezone-aware `datetime`，明示 `Asia/Taipei`。市場資料事件須先發生才可取得。已知的 `published_at` 必須介於事件與取得時間之間，`available_at` 最早為公布時間。缺少 `published_at` 時，`available_at` 最早為首次取得時間。
 - 原因：事件發生時間不等於資訊公開或策略可用時間。
 - 後果：未知公布時間需由未來來源 adapter 套用保守延遲，不能由 schema 猜測。
 

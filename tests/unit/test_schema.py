@@ -14,7 +14,7 @@ def market_event(**overrides: object) -> MarketEvent:
         "event_at": datetime(2026, 11, 13, 9, tzinfo=TAIPEI),
         "published_at": None,
         "ingested_at": datetime(2026, 11, 13, 9, 1, tzinfo=TAIPEI),
-        "available_at": datetime(2026, 11, 13, 9, tzinfo=TAIPEI),
+        "available_at": datetime(2026, 11, 13, 9, 1, tzinfo=TAIPEI),
     }
     values.update(overrides)
     return MarketEvent.model_validate(values)
@@ -37,6 +37,26 @@ def test_market_event_rejects_non_taipei_offset() -> None:
 def test_market_event_rejects_available_before_event() -> None:
     with pytest.raises(ValidationError, match="available_at must be at or after event_at"):
         market_event(available_at=datetime(2026, 11, 13, 8, 59, tzinfo=TAIPEI))
+
+
+def test_market_event_rejects_ingestion_before_event() -> None:
+    with pytest.raises(ValidationError, match="ingested_at must be at or after event_at"):
+        market_event(ingested_at=datetime(2026, 11, 13, 8, 59, tzinfo=TAIPEI))
+
+
+@pytest.mark.parametrize("hour, minute", [(8, 59), (9, 2)])
+def test_market_event_rejects_publication_outside_event_and_ingestion(
+    hour: int, minute: int
+) -> None:
+    with pytest.raises(ValidationError, match="published_at must be between"):
+        market_event(published_at=datetime(2026, 11, 13, hour, minute, tzinfo=TAIPEI))
+
+
+def test_market_event_requires_publication_evidence_for_availability_before_ingestion() -> None:
+    event_at = datetime(2026, 11, 13, 9, tzinfo=TAIPEI)
+    with pytest.raises(ValidationError, match="available_at must be at or after ingested_at"):
+        market_event(available_at=event_at)
+    assert market_event(available_at=event_at, published_at=event_at).available_at == event_at
 
 
 def test_signal_rejects_data_unavailable_at_decision() -> None:
