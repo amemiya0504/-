@@ -1,0 +1,49 @@
+# TAIFEX contract specifications, after-hours rules and 2026 calendar (see docs/assumptions.md).
+covered_from: 2026-01-01
+covered_through: 2026-12-31
+closed_dates:
+  - 2026-01-01
+  - 2026-02-12
+  - 2026-02-13
+  - 2026-02-16
+  - 2026-02-17
+  - 2026-02-18
+  - 2026-02-19
+  - 2026-02-20
+  - 2026-02-27
+  - 2026-04-03
+  - 2026-04-06
+  - 2026-05-01
+  - 2026-06-19
+  - 2026-07-10
+  - 2026-09-25
+  - 2026-09-28
+  - 2026-10-09
+  - 2026-10-23
+  - 2026-10-26
+  - 2026-12-25
+cash_close: '13:30'
+contracts:
+  TX:
+    - effective_from: 2017-05-15
+      multiplier_ntd: 200
+      tick_points: 1
+      day_open: '08:45'
+      day_close: '13:45'
+      expiry_close: '13:30'
+      night_open: '15:00'
+      night_close: '05:00'
+  MTX:
+    - effective_from: 2017-05-15
+      multiplier_ntd: 50
+      tick_points: 1
+      day_open: '08:45'
+      day_close: '13:45'
+      expiry_close: '13:30'
+      night_open: '15:00'
+      night_close: '05:00'
+expiry_overrides:
+  TX:
+    '202602': 2026-02-23
+  MTX:
+    '202602': 2026-02-23

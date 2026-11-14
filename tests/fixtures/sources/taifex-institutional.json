@@ -1,0 +1,8 @@
+[
+  {"Date":"20261113","ContractCode":"臺股期貨","Item":"自營商","TradingVolume(Net)":"-15","OpenInterest(Net)":"-23"},
+  {"Date":"20261113","ContractCode":"臺股期貨","Item":"投信","TradingVolume(Net)":"15","OpenInterest(Net)":"17"},
+  {"Date":"20261113","ContractCode":"臺股期貨","Item":"外資及陸資","TradingVolume(Net)":"12","OpenInterest(Net)":"6"},
+  {"Date":"20261113","ContractCode":"小型臺指期貨","Item":"自營商","TradingVolume(Net)":"-17","OpenInterest(Net)":"-10"},
+  {"Date":"20261113","ContractCode":"小型臺指期貨","Item":"投信","TradingVolume(Net)":"4","OpenInterest(Net)":"3"},
+  {"Date":"20261113","ContractCode":"小型臺指期貨","Item":"外資及陸資","TradingVolume(Net)":"1","OpenInterest(Net)":"-2"}
+]

@@ -4,10 +4,10 @@ version = "0.1.0"
 description = "台指期量化研究系統的離線研究骨架"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
-dependencies = ["pydantic>=2.8,<3", "tzdata>=2024.1"]
+dependencies = ["pydantic>=2.8,<3", "PyYAML>=6,<7", "tzdata>=2024.1"]
 
 [dependency-groups]
-dev = ["pytest>=8,<9", "ruff>=0.8,<1", "mypy>=1.13,<2"]
+dev = ["pytest>=8,<9", "ruff>=0.8,<1", "mypy>=1.13,<2", "types-PyYAML>=6,<7"]
 
 [build-system]
 requires = ["hatchling"]
