@@ -2,7 +2,7 @@
 
 import json
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import ClassVar, Literal, Protocol
 
@@ -164,7 +164,10 @@ def observation(
     contract_month: str | None = None,
     participant: str | None = None,
     published_at: datetime | None = None,
+    unknown_publication_delay: timedelta = timedelta(0),
 ) -> Observation:
+    if unknown_publication_delay < timedelta(0):
+        raise ValueError("unknown_publication_delay must be non-negative")
     if event_at > snapshot.ingested_at:
         raise ValueError("source row arrived before the event")
     if published_at is not None and not event_at <= published_at <= snapshot.ingested_at:
@@ -174,7 +177,7 @@ def observation(
         next_day = calendar.next_trade_date(snapshot.trade_date)
         clock = instrument_id if instrument_id in calendar.contracts else "TX"
         open_at = datetime.combine(next_day, calendar.spec(clock, next_day).day_open, TAIPEI)
-        available_at = max(open_at, available_at)
+        available_at = max(open_at + unknown_publication_delay, available_at)
     return Observation(
         source_id=source_id,
         trade_date=snapshot.trade_date,
