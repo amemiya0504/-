@@ -29,3 +29,5 @@
 | `twse-index` | `close` 為 TAIEX 收盤點數，`market_shares_traded` 為上市市場成交股數。 |
 
 SQLite 以來源識別、端點雜湊、交易日、原始回應 SHA-256 識別快照。新內容保留為新快照，相同內容重用首次取得時間。擷取會重新驗證快照 SHA-256、重新解析並記錄標準化資料與缺口。無缺口的擷取結果才會更新目前快照指標。缺列檢查涵蓋商品／時段、商品／法人身分與日收盤，個別合約的預期掛牌清單仍待建立。
+
+Point-in-time 查詢只納入 `available_at <= decision_at` 的觀測，對同一邏輯事件依 `available_at`、`ingested_at` 選取當時最新修訂；後續修訂不會回寫早期查詢。`audit_observations` 保留完整 raw versions，先依決策截止時間過濾，再對可用版本做 duplicate、gap、outlier 與 session-boundary 檢查；未指定 `decision_at` 時以最大 `available_at` 作目前資料視圖。TAIEX 需為交易日的日盤收盤資料，TX／MTX 法人彙總需對齊交易日日盤收盤。缺少 `published_at` 時仍依 adapter 的 T+1 日盤開盤與首次取得時間較晚者推算，`unknown_publication_delay` 可增加保守延遲，並由 `availability_estimated` 標示。5 分 K 僅在 `available_at >= bar_end` 且整段位於同一 session/trade date 後可進入特徵查詢。這是合成測試驗證的程式契約，並未確認任何盤中資料來源、歷史可追溯性或資料授權。
