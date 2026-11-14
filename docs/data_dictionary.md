@@ -14,7 +14,18 @@
 | `available_at` | 策略最早可使用時間 |
 | `source_revision` | 來源修訂版本 |
 | `checksum` | 原始內容校驗值 |
+| `availability_estimated` | 來源未提供 `published_at` 時為真；下一交易日期貨日盤開盤為可得時間下限 |
+| `session` | `day` 或 `night`，按商品彙總的法人資料留空 |
+| `participant` | 按商品彙總的法人身分，其他來源留空 |
 | `decision_at` | 策略作出訊號決策的時間 |
 | `fill_at` | 訂單成交時間；必須晚於所屬訊號 |
 
-`MarketEvent` 目前是來源資料事件的最小 schema。其他事件以其自身事件時間記錄；尚未建立跨事件資料可得性連接或原始資料稽核流程。
+`Observation` 沿用 `MarketEvent` 的時間欄位與來源識別。期貨行情的 `event_at` 是該契約交易時段的收盤時間，法人日彙總用期貨日盤收盤時間，TAIEX 用 TWSE 一般交易收盤 13:30。API 未提供可核對的公布時間，所以 `published_at` 留空。`source_revision` 優先使用 HTTP `ETag`，缺少時以 `sha256:` 加上快照 SHA-256 表示。 [TWSE 交易制度](https://www.twse.com.tw/zh/products/system/trading.html)
+
+| 來源 | `values` |
+|---|---|
+| `taifex-futures` | 單一月／週契約的 `open`、`high`、`low`、`close`、`volume`、`settlement`、`open_interest`。來源的空欄位保留 `null`，價差列略過。 |
+| `taifex-institutional` | `trading_volume_net`、`open_interest_net`，口數按商品與法人身分彙總，`contract_month` 留空。 |
+| `twse-index` | `close` 為 TAIEX 收盤點數，`market_shares_traded` 為上市市場成交股數。 |
+
+SQLite 以來源識別、端點雜湊、交易日、原始回應 SHA-256 識別快照。新內容保留為新快照，相同內容重用首次取得時間。擷取會重新驗證快照 SHA-256、重新解析並記錄標準化資料與缺口。無缺口的擷取結果才會更新目前快照指標。缺列檢查涵蓋商品／時段、商品／法人身分與日收盤，個別合約的預期掛牌清單仍待建立。
