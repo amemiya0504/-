@@ -29,6 +29,7 @@ class OrderRequest(Schema):
     stop_price: Decimal | None = Field(default=None, gt=0)
     stop_distance: Decimal | None = Field(default=None, gt=0)
     target_price: Decimal | None = Field(default=None, gt=0)
+    target_distance: Decimal | None = Field(default=None, gt=0)
     exit_at: datetime | None = None
 
     @field_validator("exit_at")
@@ -40,11 +41,14 @@ class OrderRequest(Schema):
     def validate_bracket(self) -> Self:
         stop, target = self.stop_price, self.target_price
         if self.reduce_only and any(
-            value is not None for value in (stop, self.stop_distance, target, self.exit_at)
+            value is not None
+            for value in (stop, self.stop_distance, target, self.target_distance, self.exit_at)
         ):
             raise ValueError("reduce-only orders cannot open a protective bracket")
         if stop is not None and self.stop_distance is not None:
             raise ValueError("specify either a stop price or a distance from entry")
+        if target is not None and self.target_distance is not None:
+            raise ValueError("specify either a target price or a distance from entry")
         if (
             stop is not None
             and target is not None
