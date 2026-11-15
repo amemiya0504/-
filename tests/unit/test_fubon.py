@@ -9,7 +9,7 @@ import pytest
 
 from gtts.data.calendar import TradingCalendar
 from gtts.data.schema import TAIPEI
-from gtts.data.sources.fubon import FubonFuturesCandles
+from gtts.data.sources.fubon import FubonFuturesCandles, save_jsonl
 
 TRADE_DATE = date(2026, 11, 13)
 RETRIEVED = datetime(2026, 11, 16, 8, 45, tzinfo=TAIPEI)
@@ -106,6 +106,18 @@ def test_rejects_unexpected_exchange() -> None:
         )
 
 
+def test_rejects_invalid_calendar_or_ingest_time_before_api_call() -> None:
+    client = Mock()
+    source = FubonFuturesCandles(client, calendar())
+
+    with pytest.raises(ValueError, match="requested session does not exist"):
+        source.read("TXF", "202611", date(2026, 11, 15), "regular", RETRIEVED)
+    with pytest.raises(ValueError, match="Asia/Taipei"):
+        source.read("TXF", "202611", TRADE_DATE, "regular", datetime(2026, 11, 13, 9))
+
+    client.candles.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("session", "trade_date", "timestamp"),
     [
@@ -157,6 +169,30 @@ def test_reads_mxf_afterhours_with_exchange_trade_date() -> None:
     assert candle.bar_start.date() == date(2026, 11, 12)
     assert candle.session == "afterhours"
     assert candle.provenance["tradeDate"] == "2026-11-13"
+
+
+def test_defaults_availability_to_retrieval_time_after_api_response() -> None:
+    client = Mock(candles=Mock(return_value=fixture()))
+
+    candles = FubonFuturesCandles(client, calendar()).read("TXF", "202611", TRADE_DATE, "regular")
+
+    assert candles
+    assert candles[0].available_at >= candles[0].bar_end
+    assert candles[0].available_at <= datetime.now(TAIPEI)
+
+
+def test_save_jsonl_preserves_candles_and_never_overwrites(tmp_path: Path) -> None:
+    client = Mock(candles=Mock(return_value=fixture()))
+    candles = FubonFuturesCandles(client, calendar()).read(
+        "TXF", "202611", TRADE_DATE, "regular", RETRIEVED
+    )
+    output = tmp_path / "bars.jsonl"
+
+    save_jsonl(output, candles)
+
+    assert len(output.read_text(encoding="utf-8").splitlines()) == len(candles)
+    with pytest.raises(FileExistsError):
+        save_jsonl(output, candles)
 
 
 def test_rejects_bad_timestamps_duplicates_and_early_retrieval() -> None:

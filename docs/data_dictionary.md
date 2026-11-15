@@ -33,9 +33,9 @@
 
 ## Fubon 歷史 5 分 K raw schema
 
-`FubonFuturesCandles` 只讀取明確月份的 TXF／MXF，盤別為 `regular`／`afterhours`，週期固定 5 分鐘。SDK client 與 `TradingCalendar` 由呼叫端注入；adapter 不建立 SDK、不登入、不連線。Adapter 僅接受 `exchange=TAIFEX`，並以合約、交易日、盤別及 `session_at` 檢查每根 5 分 K 的起訖時間完整落在對應日盤／夜盤。`FubonCandle` 保留 API 原始 `date` 字串、OHLCV、來源識別、逐根回應列的 canonical JSON SHA-256 與查詢 provenance。API 沒有回傳 source revision 或公布時間，兩者不補造。
+`FubonFuturesCandles` 只讀取明確月份的 TXF／MXF，盤別為 `regular`／`afterhours`，週期固定 5 分鐘。SDK client 與 `TradingCalendar` 由呼叫端注入；adapter 不建立 SDK、不登入、不連線。`scripts/ingest_fubon.py` 是選配的唯讀連接器，使用 SDK 2.4.0 以上版本登入行情並把單日回應保存為新的 JSONL 快照。Adapter 僅接受 `exchange=TAIFEX`，並以合約、交易日、盤別及 `session_at` 檢查每根 5 分 K 的起訖時間完整落在對應日盤／夜盤。`FubonCandle` 保留 API 原始 `date` 字串、OHLCV、來源識別、逐根回應列的 canonical JSON SHA-256 與查詢 provenance。API 沒有回傳 source revision 或公布時間，兩者不補造。
 
-Fubon API 把 `date` 定義為 K 棒起始時間，沒有獨立的開盤價或開盤量可得時間。Adapter 將 `available_at` 保守設為明確傳入的 `ingested_at`，標記 `availability_estimated=True`；不可用這些歷史回補資料推定它們在原始 K 棒時間已可取得。資料只在首次擷取後可用於 point-in-time 決策。
+Fubon API 把 `date` 定義為 K 棒起始時間，沒有獨立的開盤價或開盤量可得時間。Adapter 將 `available_at` 保守設為明確傳入的 `ingested_at`；未指定時，則在 API 回應後取台北時間，並標記 `availability_estimated=True`。不可用這些歷史回補資料推定它們在原始 K 棒時間已可取得。資料只在首次擷取後可用於 point-in-time 決策。
 
 `FubonCandle` 刻意不自動轉為 `FeatureEvent`。後續品質轉換可使用已完成 OHLCV 與 `bar_start`／`bar_end`，但不得填入 `open_price_available_at` 或 `open_volume_available_at` 作為開盤證據。此來源不能用於精確開盤撮合；在取得可核證的獨立開盤事件前，也不得供依賴開盤價／開盤量的撮合路徑使用。Fubon 分 K 只計單式委託成交，不含價差委託兩腿及鉅額交易。
 

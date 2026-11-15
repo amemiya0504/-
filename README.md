@@ -31,6 +31,12 @@ uv run python scripts/ingest_daily.py --live --date 2026-11-13 --database data/g
 
 S1 的資料、校準、成本與退出規則見 [S1 法人貝氏訊號](docs/backtest_protocol.md#s1-法人貝氏訊號)。可跑 `uv run pytest tests/unit/test_institutional.py` 重現合成資料的 OOS 流程。
 
-Fubon 歷史 K 線端點自 SDK v2.4.0 起提供；adapter 使用呼叫端注入的 client，未安裝、登入或連線 SDK。SDK 回補資料只標示首次擷取時間，現有 fixture 與策略測試都是合成資料，尚未建立真實績效。S2 的公式、資料時點與限制見 [S2 同步基差回歸](docs/backtest_protocol.md#s2-同步基差回歸)。
+Fubon 歷史 K 線端點自 SDK v2.4.0 起提供。用 `uv sync --extra fubon` 安裝選配 SDK 後，可執行下列唯讀擷取命令；執行時會隱藏詢問登入資訊，並把指定月契約的單一交易日 5 分 K 存成新的 JSONL 快照：
+
+```powershell
+uv run --extra fubon python scripts/ingest_fubon.py --date 2026-11-13 --contract-month 202611 --product TXF --session regular --certificate D:\fadacai\fbs\your-certificate.p12
+```
+
+本機 `D:\fadacai\fbs` 的 2.2.8 wheel 不含期貨歷史 K 線端點。擷取資料只標示 API 首次回傳時間，沒有歷史發布時間或可核證的開盤事件；可供收盤後研究，不能證明原始 K 棒開盤時已可用。現有 fixture 與策略測試仍是合成資料，尚未建立真實績效。S2 的公式、資料時點與限制見 [S2 同步基差回歸](docs/backtest_protocol.md#s2-同步基差回歸)。
 
 S3 使用前 20 個完整日盤估計波動分位數與同時段量能 z-score，只在高波動且放量突破時入場；其 Donchian baseline 不套這兩個篩選，但沿用相同風險、成本及退出規則。兩者資料需求、收盤訊號至下一開盤成交、到期拒單與合成資料限制見 [S3 波動狀態突破](docs/backtest_protocol.md#s3-波動狀態突破)。
