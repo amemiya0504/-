@@ -1,6 +1,6 @@
 # 回測協定
 
-`gtts.engine.backtest.run_backtest(calendar, schedules, initial_cash, bars, ...)` 是離線 TX／MTX 模擬。輸入實際交割月的 5 分 OHLCV `FeatureEvent`、`Decimal` 初始資金、`OrderRequest`／`RollRequest`，以及有來源的 `SettlementEvent`。可用 `on_feature` 產生委託，callback 收到特徵時，可用 `feature.available_at` 作為決策時間。可用 `before` 限定事件必須發生於截止前，行事曆檢查也會排程到截止前，即使沒有新的完整棒。若只取得開盤證據，可用 `opening_only_bars` 輸入。此路徑僅讀開盤資訊，不產生完整棒特徵。結果分列訂單、成交、資產快照、結算與 audit。
+`gtts.engine.backtest.run_backtest(calendar, schedules, initial_cash, bars, ...)` 是離線 TX／MTX 模擬。輸入實際交割月的 5 分 OHLCV `FeatureEvent`、`Decimal` 初始資金、`OrderRequest`／`RollRequest`，以及有來源的 `SettlementEvent`。可用 `on_feature` 產生委託，callback 收到特徵時，可用 `feature.available_at` 作為決策時間。`decision_features` 可另外安排較晚才可得的策略決策事件；每筆必須對應已輸入的完整棒，且只能修改 `available_at`，只觸發 `on_feature_with_positions`，不參與行情盯市或撮合。可用 `before` 限定事件必須發生於截止前，行事曆檢查也會排程到截止前，即使沒有新的完整棒。若只取得開盤證據，可用 `opening_only_bars` 輸入。此路徑僅讀開盤資訊，不產生完整棒特徵。結果分列訂單、成交、資產快照、結算與 audit。
 
 - 時間：`bar_start` 與 `bar_end` 是市場事件時間，`available_at` 是策略最早可用的時間。callback 在完整、合法棒的 `available_at` 被呼叫，訊號須符合 `available_at <= decision_at`。成交用決策後第一個排定的合法 5 分開盤。前棒收盤、訊號與次棒開盤同時間戳時，先處理收盤、訊號，再把成交記為開盤邊界後 1 微秒。這個偏移只表示先後，K 棒無法提供實際逐筆成交時間。相同輸入與決策會得到相同輸出。
 - 撮合資料：市場 OHLC 只使用可信的首次市場觀測版本。每個商品、交割月、`bar_start` 只接受一筆 K 棒，重複時整次回測會在執行前失敗。來源有修訂時須先按當時可得資訊做 point-in-time 清理，保留首次可追溯的市場觀測。晚到的修訂不得改寫先前的模擬成交。
@@ -27,3 +27,11 @@
 - 以 0.60／0.40 機率門檻產生長／短方向。期望毛利達決策當下估計來回成本的兩倍才送出一口委託。單純外資淨額變化方向、首棒價格動能及相同特徵的 logistic regression 共用同一撮合、成本與退出規則。比較結果含逐筆成交、資產快照、audit、Brier score 與機率分箱。OOS 校準從同一組回測 K 棒、日曆與成本重算固定區間標籤。現有測試僅用合成資料，真實 OOS 表仍需有合法分鐘行情與經核對的歷史成本。
 
 OOS 決策的成本門檻依該次回放傳入的成本表重算，缺有效成本列時不產生委託。若開盤事件在截止前已可得，可依當時的開盤價與容量成交，即使完整棒在截止後才可得。這種情況只回放開盤，晚到的整棒欄位不參與回放，也不做該筆 OOS 標籤。到期、結算期限等行事曆檢查仍跑到截止前，保留未結清 audit。
+
+## S2 同步基差回歸
+
+`gtts.features.basis.make_basis_point` 僅配對同一交易日、同一 5 分鐘起訖時間的 TAIEX 與 MTX 日盤資料。TAIEX 棒須位於 09:00 至 13:30 現貨時段；MTX 棒須落在合約日盤、對齊 5 分鐘格線、成交量為正且非停牌。排除合約最後交易日。未知股利資料不產生基差點；股利已建模時只能使用決策時已可得的現值。利率及可得時間皆有效時，參考價為 `(S - PV(D)) * exp(r * tau)`，`tau` 由棒結束時計至最後交易日的期貨日盤收盤；利率缺失或晚到時使用 `S - PV(D)`，並將點標成 simplified，不視為完整公允價。
+
+`basis_zscore` 僅用同月份、同 basis kind、決策時已可得且時間早於目前棒的最近 60 點，標準差採樣本估計；重複歷史時間拒算。`gtts.strategies.basis_reversion.compare_basis` 以 `z > 2` 做空 MTX、`z < -2` 做多一口；持倉在 `|z| < 0.5` 平倉，另設 1.5 ATR 停損及日盤末退出。選月只看該決策時間前已可得、日曆有效的合約棒，再選最近到期月份，避免同日較晚資料改寫較早決策。策略另與同資料區間的期貨價格均值回歸比較。基差策略只有 MTX 單腿，屬方向性研究，不是價差套利。
+
+Fubon adapter 目前只把歷史回應保存為 raw candle，並將 `available_at` 設為首次擷取時間。它沒有原始公布時間、開盤價可得時間或開盤量證據，因此不能回填成棒起始可用，也不能單獨支持精確開盤成交。現有 S2 測試使用合成資料；尚未取得 point-in-time TAIEX 盤中來源、確認資料授權或驗證任何真實策略績效。

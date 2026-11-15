@@ -24,6 +24,8 @@ class OrderRequest(Schema):
     signal: SignalEvent
     contract_month: str = Field(min_length=1)
     quantity: int = Field(gt=0)
+    reduce_only: bool = False
+    max_instrument_exposure: int | None = Field(default=None, gt=0, strict=True)
     stop_price: Decimal | None = Field(default=None, gt=0)
     stop_distance: Decimal | None = Field(default=None, gt=0)
     target_price: Decimal | None = Field(default=None, gt=0)
@@ -37,6 +39,10 @@ class OrderRequest(Schema):
     @model_validator(mode="after")
     def validate_bracket(self) -> Self:
         stop, target = self.stop_price, self.target_price
+        if self.reduce_only and any(
+            value is not None for value in (stop, self.stop_distance, target, self.exit_at)
+        ):
+            raise ValueError("reduce-only orders cannot open a protective bracket")
         if stop is not None and self.stop_distance is not None:
             raise ValueError("specify either a stop price or a distance from entry")
         if (
