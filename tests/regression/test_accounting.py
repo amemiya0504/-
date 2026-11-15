@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, localcontext
 from pathlib import Path
@@ -84,6 +85,8 @@ def order(
     stop_distance: Decimal | None = None,
     target: int | None = None,
     exit_at: datetime | None = None,
+    reduce_only: bool = False,
+    max_instrument_exposure: int | None = None,
 ) -> OrderRequest:
     return OrderRequest(
         signal=signal(tag, decision, side),
@@ -93,6 +96,8 @@ def order(
         stop_distance=stop_distance,
         target_price=target,
         exit_at=exit_at,
+        reduce_only=reduce_only,
+        max_instrument_exposure=max_instrument_exposure,
     )
 
 
@@ -1086,6 +1091,117 @@ def test_future_month_first_trades_at_listing_day_open(calendar, schedules) -> N
     assert fill.contract_month == "202702"
     assert fill.fill_at == first_open + timedelta(microseconds=1)
     assert result.audit == ()
+
+
+def test_feature_callbacks_receive_independent_market_data_copies(calendar, schedules) -> None:
+    entry = bar(at(9, 0), 1000)
+    observed: list[int | Decimal | None] = []
+
+    def mutate(feature: FeatureEvent):
+        feature.values["close"] = 2000
+        return ()
+
+    def observe(feature: FeatureEvent, positions: Mapping[tuple[str, str], int]):
+        observed.append(feature.values["close"])
+        return ()
+
+    run_backtest(
+        calendar,
+        schedules,
+        D(10000),
+        [entry],
+        on_feature=mutate,
+        on_feature_with_positions=observe,
+    )
+
+    assert observed == [1000]
+
+
+def test_order_exposure_limit_is_checked_across_contract_months(calendar, schedules) -> None:
+    result = run_backtest(
+        calendar,
+        schedules,
+        D(10000),
+        [bar(at(9, 0), 1000, month=NOV), bar(at(9, 0), 1200, month=DEC)],
+        orders=[
+            order("a", at(9, 0), "buy", month=NOV, max_instrument_exposure=1),
+            order("b", at(9, 0), "buy", month=DEC, max_instrument_exposure=1),
+        ],
+    )
+
+    assert len(result.fills) == 1
+    assert result.snapshots[-1].positions == {"TX:202611": 1}
+    assert [row.code for row in result.audit] == ["position_limit"]
+
+
+def test_reduce_only_order_is_not_rejected_by_new_exposure_limit(calendar, schedules) -> None:
+    result = run_backtest(
+        calendar,
+        schedules,
+        D(10000),
+        [
+            bar(at(9, 0), 1000, month=NOV),
+            bar(at(9, 0), 1200, month=DEC),
+            bar(at(9, 5), 1005, month=NOV),
+        ],
+        orders=[
+            order("a", at(9, 0), "buy", quantity=2, month=NOV),
+            order("b", at(9, 0), "buy", month=DEC),
+            order(
+                "reduce",
+                at(9, 5),
+                "sell",
+                month=NOV,
+                reduce_only=True,
+                max_instrument_exposure=1,
+            ),
+        ],
+    )
+
+    assert [fill.signal_id for fill in result.fills] == ["a", "b", "reduce"]
+    assert result.snapshots[-1].positions == {"TX:202611": 1, "TX:202612": 1}
+    assert not any(row.code == "position_limit" for row in result.audit)
+
+
+def test_delayed_decision_after_cutoff_does_not_require_a_replayed_source_bar(
+    calendar, schedules
+) -> None:
+    source = bar(at(10, 0), 1000)
+    decision = source.model_copy(update={"available_at": at(10, 8)})
+
+    result = run_backtest(
+        calendar,
+        schedules,
+        D(10000),
+        [source],
+        before=at(9, 30),
+        decision_features=[decision],
+        on_feature_with_positions=lambda feature, positions: [
+            order("late", feature.available_at, "buy")
+        ],
+    )
+
+    assert result.fills == ()
+
+
+def test_invalid_market_bar_cannot_trigger_a_delayed_decision(calendar, schedules) -> None:
+    source = bar(at(9, 0), 1000).model_copy(
+        update={"values": {**bar(at(9, 0), 1000).values, "close": None}}
+    )
+    decision = source.model_copy(update={"available_at": at(9, 13)})
+    seen: list[FeatureEvent] = []
+
+    result = run_backtest(
+        calendar,
+        schedules,
+        D(10000),
+        [source],
+        decision_features=[decision],
+        on_feature_with_positions=lambda feature, positions: seen.append(feature) or (),
+    )
+
+    assert seen == []
+    assert [row.code for row in result.audit] == ["incomplete_bar"]
 
 
 @pytest.mark.parametrize("volume", [1, 2])

@@ -1,7 +1,7 @@
 """Deterministic event loop for offline TX/MTX execution."""
 
 from collections import Counter, defaultdict
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -42,6 +42,7 @@ from gtts.risk.margin import Schedules
 
 Request = OrderRequest | RollRequest
 Features = Callable[[FeatureEvent], Iterable[Request]]
+PositionFeatures = Callable[[FeatureEvent, Mapping[Contract, int]], Iterable[Request]]
 ONE_DAY = timedelta(days=1)
 
 
@@ -115,6 +116,7 @@ class _Bracket:
 class _Bucket:
     opens: dict[Contract, OpeningBar] = field(default_factory=dict)
     features: list[tuple[FeatureEvent, OpeningBar]] = field(default_factory=list)
+    decisions: list[FeatureEvent] = field(default_factory=list)
     requests: list[Request] = field(default_factory=list)
     eligible: list[tuple[Request, tuple[BacktestOrder, ...]]] = field(default_factory=list)
     settlements: list[SettlementEvent] = field(default_factory=list)
@@ -151,6 +153,7 @@ class _Engine:
         self.overdue_time_exits: set[Contract] = set()
         self.margin_call = False
         self.contracts: set[Contract] = set()
+        self.valid_features: set[tuple[str, str, datetime]] = set()
         self.scheduled_through: datetime | None = None
 
     def includes(self, at: datetime) -> bool:
@@ -263,6 +266,7 @@ class _Engine:
         at: datetime,
         *,
         reduce_only: bool = False,
+        max_instrument_exposure: int | None = None,
     ) -> tuple[BacktestFill, ...]:
         trial = deepcopy(self.portfolio) if len(legs) > 1 or not reduce_only else self.portfolio
         rows = []
@@ -288,6 +292,19 @@ class _Engine:
             gross = trial.trade(order.contract, delta, ref, bar.multiplier)
             row = row.model_copy(update={"gross_pnl": gross})
             trial.apply((row,))
+            if (
+                opens_exposure
+                and max_instrument_exposure is not None
+                and sum(
+                    abs(quantity)
+                    for (instrument, _), quantity in trial.positions.items()
+                    if instrument == order.instrument_id
+                )
+                > max_instrument_exposure
+            ):
+                raise CannotFill(
+                    "position_limit", "instrument exposure exceeds the order's position limit"
+                )
             rows.append(row)
         if not reduce_only:
             old_positions, new_positions = self.portfolio.positions, trial.positions
@@ -530,9 +547,21 @@ class _Engine:
                                 "entry open or fill is outside its protective levels",
                             )
                 quoted.append((order, bar, price))
-            fills = self.execute(tuple(quoted), at)
-            if isinstance(request, OrderRequest) and (
-                stop is not None or request.target_price is not None or request.exit_at is not None
+            reduce_only = isinstance(request, OrderRequest) and request.reduce_only
+            max_exposure = (
+                request.max_instrument_exposure if isinstance(request, OrderRequest) else None
+            )
+            fills = self.execute(
+                tuple(quoted), at, reduce_only=reduce_only, max_instrument_exposure=max_exposure
+            )
+            if (
+                isinstance(request, OrderRequest)
+                and not request.reduce_only
+                and (
+                    stop is not None
+                    or request.target_price is not None
+                    or request.exit_at is not None
+                )
             ):
                 entry = legs[0]
                 self.brackets[entry.contract] = _Bracket(
@@ -612,6 +641,7 @@ class _Engine:
         self,
         features: Iterable[FeatureEvent],
         opening_only: Iterable[FeatureEvent],
+        decision_features: Iterable[FeatureEvent],
         orders: Iterable[Request],
         settlements: Iterable[SettlementEvent],
     ) -> None:
@@ -641,6 +671,27 @@ class _Engine:
                 if self.includes(available):
                     self.bucket(available).features.append((feature, bar))
             self.contracts.add(key)
+        source_by_key = {
+            (row.instrument_id, row.contract_month or "", row.bar_start): row
+            for row, complete in execution_bars.values()
+            if complete
+        }
+        for decision in decision_features:
+            if not self.includes(decision.available_at):
+                continue
+            decision_key = (
+                decision.instrument_id,
+                decision.contract_month or "",
+                decision.bar_start,
+            )
+            source = source_by_key.get(decision_key)
+            if source is None:
+                raise ValueError("decision feature must match a completed execution bar")
+            if decision.model_copy(update={"available_at": source.available_at}) != source:
+                raise ValueError("decision feature may only change its availability time")
+            if decision.available_at <= max(source.available_at, source.bar_end):
+                raise ValueError("decision feature must be later than its execution bar")
+            self.bucket(decision.available_at).decisions.append(decision)
         for order in orders:
             signal = order.signal
             if self.includes(signal.decision_at):
@@ -688,7 +739,11 @@ class _Engine:
                         self.bucket(final_open).expires.add(key)
                 day += ONE_DAY
 
-    def run(self, on_feature: Features | None) -> BacktestResult:
+    def run(
+        self,
+        on_feature: Features | None,
+        on_feature_with_positions: PositionFeatures | None,
+    ) -> BacktestResult:
         while self.clock:
             at = heappop(self.clock)
             bucket = self.buckets.pop(at)
@@ -702,6 +757,9 @@ class _Engine:
                     self.log(at, opened.key, exc.code, str(exc))
                     continue
                 features.append(feature)
+                self.valid_features.add(
+                    (feature.instrument_id, feature.contract_month or "", feature.bar_start)
+                )
                 if feature.bar_end == at:
                     self.protect(bar, at - AFTER)
                 elif bar.intrabar_volume:
@@ -738,9 +796,29 @@ class _Engine:
                 self.snapshot(at)
 
             requests = bucket.requests
-            if on_feature is not None:
-                for feature in features:
+            for feature in features:
+                if on_feature is not None:
                     requests.extend(on_feature(feature.model_copy(deep=True)))
+                if on_feature_with_positions is not None:
+                    requests.extend(
+                        on_feature_with_positions(
+                            feature.model_copy(deep=True), dict(self.portfolio.positions)
+                        )
+                    )
+            if on_feature_with_positions is not None:
+                for decision in bucket.decisions:
+                    decision_key = (
+                        decision.instrument_id,
+                        decision.contract_month or "",
+                        decision.bar_start,
+                    )
+                    if decision_key not in self.valid_features:
+                        continue
+                    requests.extend(
+                        on_feature_with_positions(
+                            decision.model_copy(deep=True), dict(self.portfolio.positions)
+                        )
+                    )
             counts = Counter(item.signal.signal_id for item in requests)
             for row in sorted(requests, key=lambda item: item.signal.signal_id):
                 if counts[row.signal.signal_id] > 1:
@@ -838,11 +916,13 @@ def run_backtest(
     *,
     before: datetime | None = None,
     opening_only_bars: Iterable[FeatureEvent] = (),
+    decision_features: Iterable[FeatureEvent] = (),
     orders: Iterable[Request] = (),
     settlements: Iterable[SettlementEvent] = (),
     on_feature: Features | None = None,
+    on_feature_with_positions: PositionFeatures | None = None,
 ) -> BacktestResult:
-    """Simulate reproducibly, optionally capping data and calendar replay before a cutoff."""
+    """Replay market bars and optional callback-only decisions reproducibly before a cutoff."""
     if not isinstance(initial_cash, Decimal) or not initial_cash.is_finite() or initial_cash < 0:
         raise ValueError("initial_cash must be a finite, non-negative Decimal")
     with localcontext(Context(prec=50)):
@@ -852,5 +932,5 @@ def run_backtest(
             initial_cash,
             _taipei_datetime(before) if before is not None else None,
         )
-        engine.prepare(bars, opening_only_bars, orders, settlements)
-        return engine.run(on_feature)
+        engine.prepare(bars, opening_only_bars, decision_features, orders, settlements)
+        return engine.run(on_feature, on_feature_with_positions)

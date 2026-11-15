@@ -1,0 +1,28 @@
+{
+  "product": "TXF",
+  "contractMonth": "202611",
+  "exchange": "TAIFEX",
+  "session": "REGULAR",
+  "timeframe": "5",
+  "sort": "asc",
+  "data": [
+    {
+      "date": "2026-11-13T09:00:00.000+08:00",
+      "contractMonth": "202611",
+      "open": 27500,
+      "high": 27510,
+      "low": 27495,
+      "close": 27505,
+      "volume": 123
+    },
+    {
+      "date": "2026-11-13T09:05:00.000+08:00",
+      "contractMonth": "202611",
+      "open": 27505,
+      "high": 27515,
+      "low": 27500,
+      "close": 27510,
+      "volume": 98
+    }
+  ]
+}

@@ -31,6 +31,14 @@
 | `taifex-institutional` | `trading_volume_net`、`open_interest_net`，口數按商品與法人身分彙總，`contract_month` 留空。 |
 | `twse-index` | `close` 為 TAIEX 收盤點數，`market_shares_traded` 為上市市場成交股數。 |
 
+## Fubon 歷史 5 分 K raw schema
+
+`FubonFuturesCandles` 只讀取明確月份的 TXF／MXF，盤別為 `regular`／`afterhours`，週期固定 5 分鐘。SDK client 與 `TradingCalendar` 由呼叫端注入；adapter 不建立 SDK、不登入、不連線。Adapter 僅接受 `exchange=TAIFEX`，並以合約、交易日、盤別及 `session_at` 檢查每根 5 分 K 的起訖時間完整落在對應日盤／夜盤。`FubonCandle` 保留 API 原始 `date` 字串、OHLCV、來源識別、逐根回應列的 canonical JSON SHA-256 與查詢 provenance。API 沒有回傳 source revision 或公布時間，兩者不補造。
+
+Fubon API 把 `date` 定義為 K 棒起始時間，沒有獨立的開盤價或開盤量可得時間。Adapter 將 `available_at` 保守設為明確傳入的 `ingested_at`，標記 `availability_estimated=True`；不可用這些歷史回補資料推定它們在原始 K 棒時間已可取得。資料只在首次擷取後可用於 point-in-time 決策。
+
+`FubonCandle` 刻意不自動轉為 `FeatureEvent`。後續品質轉換可使用已完成 OHLCV 與 `bar_start`／`bar_end`，但不得填入 `open_price_available_at` 或 `open_volume_available_at` 作為開盤證據。此來源不能用於精確開盤撮合；在取得可核證的獨立開盤事件前，也不得供依賴開盤價／開盤量的撮合路徑使用。Fubon 分 K 只計單式委託成交，不含價差委託兩腿及鉅額交易。
+
 SQLite 以來源識別、端點雜湊、交易日、原始回應 SHA-256 識別快照。新內容保留為新快照，相同內容重用首次取得時間。擷取會重新驗證快照 SHA-256、重新解析並記錄標準化資料與缺口。無缺口的擷取結果才會更新目前快照指標。缺列檢查涵蓋商品／時段、商品／法人身分與日收盤，個別合約的預期掛牌清單仍待建立。
 
 5 分 K 的 `values["volume"]` 是整棒成交量，適用於已完成特徵。開盤價和開盤容量皆須有獨立的可得時間，才能供精確開盤撮合。棒內撮合以整棒成交量扣除觀測開盤量作為粗略上限。缺少經核證的開盤成交價或正容量時，整棒高低價可能包含無法辨識的開盤價，因此不供棒內保護單撮合。目前只有合成 K 棒提供這些開盤欄位，尚無可用的授權歷史來源。

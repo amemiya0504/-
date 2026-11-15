@@ -27,6 +27,7 @@ from gtts.engine.broker import (
 )
 from gtts.engine.events import BacktestResult, OrderRequest, SettlementEvent, Side
 from gtts.features.institutional import InstitutionalFeature, Scores, institutional_feature
+from gtts.features.volatility import atr14
 from gtts.risk.margin import Schedules
 
 Variant = Literal["institutional_bayes", "institutional_logistic", "institutional_net", "momentum"]
@@ -79,45 +80,6 @@ def _round_trip_cost(bar: Bar, schedules: Schedules) -> Decimal:
     return sum((_cost_at_price(bar, side, bar.close, schedules) for side in SIDES), Decimal(0))
 
 
-def _atr(
-    decision: Bar, history: Iterable[FeatureEvent], calendar: TradingCalendar
-) -> Decimal | None:
-    candidates = sorted(
-        (
-            row
-            for row in history
-            if row.session == "day"
-            and (row.instrument_id, row.contract_month) == decision.key
-            and row.bar_start < decision.feature.bar_start
-            and row.available_at <= decision.feature.available_at
-        ),
-        key=lambda row: row.bar_start,
-    )
-    if len(candidates) < 14 or len({row.bar_start for row in candidates}) != len(candidates):
-        return None
-    previous, *bars = [executable_bar(row, calendar) for row in candidates[-14:]] + [decision]
-    ranges: list[Decimal] = []
-    for current in bars:
-        if not previous.total_volume or not current.total_volume:
-            return None
-        if previous.feature.bar_end != current.feature.bar_start and not (
-            previous.feature.bar_end == previous.session.closes_at
-            and current.feature.bar_start == current.session.opens_at
-            and previous.session.trade_date
-            == calendar.previous_trade_date(current.session.trade_date)
-        ):
-            return None
-        ranges.append(
-            max(
-                current.high - current.low,
-                abs(current.high - previous.close),
-                abs(current.low - previous.close),
-            )
-        )
-        previous = current
-    return sum(ranges, Decimal(0)) / len(ranges)
-
-
 def opportunity(
     observations: Iterable[Observation],
     history: Iterable[FeatureEvent],
@@ -153,7 +115,7 @@ def opportunity(
         )
         if feature is None:
             return None
-        atr = _atr(bar, history, calendar)
+        atr = atr14(bar, history, calendar)
         if atr is None or atr <= 0:
             return None
         cost = _round_trip_cost(bar, schedules)
