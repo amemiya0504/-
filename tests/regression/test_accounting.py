@@ -84,6 +84,7 @@ def order(
     stop: int | None = None,
     stop_distance: Decimal | None = None,
     target: int | None = None,
+    target_distance: Decimal | None = None,
     exit_at: datetime | None = None,
     reduce_only: bool = False,
     max_instrument_exposure: int | None = None,
@@ -95,6 +96,7 @@ def order(
         stop_price=stop,
         stop_distance=stop_distance,
         target_price=target,
+        target_distance=target_distance,
         exit_at=exit_at,
         reduce_only=reduce_only,
         max_instrument_exposure=max_instrument_exposure,
@@ -625,6 +627,29 @@ def test_relative_stop_is_rounded_from_the_slipped_entry_fill(
     assert (entry.reason, entry.price) == ("signal", fill_price)
     assert (stop.reason, stop.reference_price) == ("stop", trigger_price)
     assert abs(stop.reference_price - entry.price) == 7
+
+
+def test_relative_target_is_anchored_to_slipped_entry_fill(calendar, schedules) -> None:
+    request = order("target-distance", at(9, 5), "buy", target_distance=D(5))
+    result = run_backtest(
+        calendar,
+        schedules,
+        D(10000),
+        [
+            bar(at(9, 0), 1000),
+            bar(at(9, 5), 1020),
+            bar(at(9, 10), 1022, high=1027, low=1020, close=1025, opening_volume=1),
+        ],
+        orders=[request],
+    )
+
+    entry, target = result.fills
+    assert (entry.reason, entry.price) == ("signal", D(1021))
+    assert (target.reason, target.reference_price, target.price) == (
+        "target",
+        D(1026),
+        D(1025),
+    )
 
 
 def test_missed_timed_exit_blocks_same_product_across_months_until_flat(

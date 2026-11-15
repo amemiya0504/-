@@ -1,6 +1,6 @@
 # GTTS：賽局理論 × 台指期量化研究系統
 
-專案提供台指期研究的時間契約、TX／MTX 交易日曆、TAIFEX／TWSE 日資料擷取、Fubon 期貨歷史 5 分 K raw adapter、離線期貨回測，以及 S1 法人貝氏與 S2 同步基差研究策略。時間戳採 `Asia/Taipei`，研究訊號只能使用決策時已可得的資料。系統限於研究與紙上模擬。
+專案提供台指期研究的時間契約、TX／MTX 交易日曆、TAIFEX／TWSE 日資料擷取、Fubon 期貨歷史 5 分 K raw adapter、離線期貨回測，以及 S1 法人貝氏、S2 同步基差、S3 波動狀態突破研究策略。時間戳採 `Asia/Taipei`，研究訊號只能使用決策時已可得的資料。系統限於研究與紙上模擬。
 
 ## 離線 smoke
 
@@ -32,3 +32,5 @@ uv run python scripts/ingest_daily.py --live --date 2026-11-13 --database data/g
 S1 的資料、校準、成本與退出規則見 [S1 法人貝氏訊號](docs/backtest_protocol.md#s1-法人貝氏訊號)。可跑 `uv run pytest tests/unit/test_institutional.py` 重現合成資料的 OOS 流程。
 
 Fubon 歷史 K 線端點自 SDK v2.4.0 起提供；adapter 使用呼叫端注入的 client，未安裝、登入或連線 SDK。SDK 回補資料只標示首次擷取時間，現有 fixture 與策略測試都是合成資料，尚未建立真實績效。S2 的公式、資料時點與限制見 [S2 同步基差回歸](docs/backtest_protocol.md#s2-同步基差回歸)。
+
+S3 使用前 20 個完整日盤估計波動分位數與同時段量能 z-score，只在高波動且放量突破時入場；其 Donchian baseline 不套這兩個篩選，但沿用相同風險、成本及退出規則。兩者資料需求、收盤訊號至下一開盤成交、到期拒單與合成資料限制見 [S3 波動狀態突破](docs/backtest_protocol.md#s3-波動狀態突破)。

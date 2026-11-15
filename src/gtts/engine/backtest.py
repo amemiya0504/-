@@ -475,6 +475,7 @@ class _Engine:
         self, request: Request, legs: tuple[BacktestOrder, ...], at: datetime, bucket: _Bucket
     ) -> None:
         stop: Decimal | None = None
+        target: Decimal | None = None
         try:
             if isinstance(request, RollRequest):
                 old, new = legs
@@ -512,9 +513,13 @@ class _Engine:
                     stop, target = request.stop_price, request.target_price
                     levels = [p for p in (stop, target) if p is not None]
                     distance = request.stop_distance
-                    if (levels or distance is not None or request.exit_at is not None) and (
-                        old_qty or any(p % bar.tick for p in levels)
-                    ):
+                    target_distance = request.target_distance
+                    if (
+                        levels
+                        or distance is not None
+                        or target_distance is not None
+                        or request.exit_at is not None
+                    ) and (old_qty or any(p % bar.tick for p in levels)):
                         raise CannotFill(
                             "invalid_bracket",
                             "protection requires a flat start and tick-aligned prices",
@@ -527,7 +532,7 @@ class _Engine:
                             "invalid_time_exit",
                             "timed exit must be a later opening in the entry session",
                         )
-                    if levels or distance is not None:
+                    if levels or distance is not None or target_distance is not None:
                         row = quote(order, bar, price, at, self.schedules)
                         if distance is not None:
                             long = order.side == "buy"
@@ -538,6 +543,17 @@ class _Engine:
                             ) * bar.tick
                             if stop <= 0:
                                 raise CannotFill("invalid_bracket", "stop must be positive")
+                        if target_distance is not None:
+                            long = order.side == "buy"
+                            level = (
+                                row.price + target_distance if long else row.price - target_distance
+                            )
+                            rounding = ROUND_FLOOR if long else ROUND_CEILING
+                            target = (level / bar.tick).to_integral_value(
+                                rounding=rounding
+                            ) * bar.tick
+                            if target <= 0:
+                                raise CannotFill("invalid_bracket", "target must be positive")
                         lower, upper = (stop, target) if order.side == "buy" else (target, stop)
                         if (lower is not None and min(price, row.price) <= lower) or (
                             upper is not None and max(price, row.price) >= upper
@@ -560,13 +576,12 @@ class _Engine:
                 and (
                     stop is not None
                     or request.target_price is not None
+                    or request.target_distance is not None
                     or request.exit_at is not None
                 )
             ):
                 entry = legs[0]
-                self.brackets[entry.contract] = _Bracket(
-                    entry, fills[0].fill_at, stop, request.target_price
-                )
+                self.brackets[entry.contract] = _Bracket(entry, fills[0].fill_at, stop, target)
                 if request.exit_at is not None and self.includes(request.exit_at + AFTER):
                     self.schedule_through(request.exit_at)
                     self.bucket(request.exit_at).timed_exits.add((entry.contract, entry.order_id))
