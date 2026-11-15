@@ -38,7 +38,9 @@ from gtts.engine.events import (
 )
 from gtts.engine.portfolio import ZERO, Portfolio, signed
 from gtts.engine.roll import roll_orders
+from gtts.risk.limits import RiskGate, RiskLimits
 from gtts.risk.margin import Schedules
+from gtts.risk.stops import stop_from_distance, stop_loss_amount
 
 Request = OrderRequest | RollRequest
 Features = Callable[[FeatureEvent], Iterable[Request]]
@@ -106,6 +108,7 @@ def _settlement_cutoff(
 @dataclass
 class _Bracket:
     entry: BacktestOrder
+    strategy_id: str
     entry_fill_at: datetime
     stop: Decimal | None
     target: Decimal | None
@@ -116,6 +119,7 @@ class _Bracket:
 class _Bucket:
     opens: dict[Contract, OpeningBar] = field(default_factory=dict)
     features: list[tuple[FeatureEvent, OpeningBar]] = field(default_factory=list)
+    data_errors: list[tuple[Contract, str]] = field(default_factory=list)
     decisions: list[FeatureEvent] = field(default_factory=list)
     requests: list[Request] = field(default_factory=list)
     eligible: list[tuple[Request, tuple[BacktestOrder, ...]]] = field(default_factory=list)
@@ -133,17 +137,20 @@ class _Engine:
         schedules: Schedules,
         cash: Decimal,
         before: datetime | None,
+        risk_limits: RiskLimits | None,
     ):
         self.calendar = calendar
         self.schedules = schedules
         self.before = before
         self.portfolio = Portfolio(cash)
+        self.risk_gate = RiskGate(risk_limits) if risk_limits is not None else None
+        self.current_trade_date: date | None = None
         self.clock: list[datetime] = []
         self.buckets: dict[datetime, _Bucket] = {}
         self.orders: list[BacktestOrder] = []
         self.fills: list[BacktestFill] = []
         self.audit: list[Audit] = []
-        self.mark_times: dict[Contract, tuple[datetime, bool]] = {}
+        self.mark_times: dict[Contract, tuple[datetime, bool, int]] = {}
         self.snapshots: dict[datetime, BacktestSnapshot] = {}
         self.settlements: list[SettlementRecord] = []
         self.signals: set[str] = set()
@@ -182,10 +189,25 @@ class _Engine:
     def record_failure(self, at: datetime, order: BacktestOrder, error: CannotFill) -> None:
         self.log(at, order.contract, error.code, str(error), order.order_id)
 
+    def halt_entries_for_data(self, at: datetime, key: Contract, detail: str) -> None:
+        if self.risk_gate is not None and self.risk_gate.halt_data(*key):
+            self.log(at, key, "data_kill_switch", detail)
+
+    def advance_trade_date(self, trade_date: date) -> None:
+        if self.current_trade_date is None or trade_date > self.current_trade_date:
+            self.current_trade_date = trade_date
+
     def mark(
-        self, key: Contract, price: Decimal, multiplier: int, at: datetime, *, opening: bool
+        self,
+        key: Contract,
+        price: Decimal,
+        multiplier: int,
+        at: datetime,
+        *,
+        opening: bool,
+        priority: int = 0,
     ) -> None:
-        timestamp = (at, opening)
+        timestamp = (at, opening, priority)
         if key not in self.mark_times or self.mark_times[key] <= timestamp:
             self.portfolio.mark(key, price, multiplier)
             self.mark_times[key] = timestamp
@@ -193,6 +215,17 @@ class _Engine:
     def snapshot(self, at: datetime) -> None:
         row = self.portfolio.snapshot(self.schedules, at)
         self.snapshots[at] = row
+        if (
+            self.risk_gate is not None
+            and self.current_trade_date is not None
+            and self.risk_gate.observe(row, self.current_trade_date)
+        ):
+            self.log(
+                at,
+                ("PORTFOLIO", ""),
+                "daily_loss_halt",
+                "daily equity loss limit reached; new entries are blocked",
+            )
         if row.maintenance_margin is None:
             if not self.margin_call:
                 for key in self.portfolio.positions:
@@ -267,6 +300,7 @@ class _Engine:
         *,
         reduce_only: bool = False,
         max_instrument_exposure: int | None = None,
+        risk_request: Request | None = None,
     ) -> tuple[BacktestFill, ...]:
         trial = deepcopy(self.portfolio) if len(legs) > 1 or not reduce_only else self.portfolio
         rows = []
@@ -314,11 +348,28 @@ class _Engine:
                 for key, quantity in new_positions.items()
             )
             if increased:
+                if self.risk_gate is not None and risk_request is not None:
+                    strategy_exposure = sum(
+                        abs(self.portfolio.quantity(key))
+                        for key, bracket in self.brackets.items()
+                        if key[0] == "MTX"
+                        and bracket.strategy_id == risk_request.signal.strategy_id
+                    )
+                    error = self.risk_gate.position_error(
+                        risk_request, trial.positions, strategy_exposure
+                    )
+                    if error is not None:
+                        raise CannotFill(*error)
                 initial, maintenance = trial.margin(self.schedules, at)
-                if maintenance is None or trial.cash + trial.unrealized < initial:
+                equity = trial.cash + trial.unrealized
+                if maintenance is None or equity < initial:
                     raise CannotFill(
                         "initial_margin", "equity after trade costs is below initial margin"
                     )
+                if self.risk_gate is not None:
+                    error = self.risk_gate.margin_error(equity, initial)
+                    if error is not None:
+                        raise CannotFill(*error)
         self.portfolio = trial
         for (order, bar, _), row in zip(legs, rows, strict=True):
             bar.remaining -= row.quantity
@@ -340,11 +391,18 @@ class _Engine:
             return
         if bar is None:
             self.log(at, key, f"{reason}_unfilled", "forced exit has no executable price")
+            self.halt_entries_for_data(
+                at, key, f"new entries halted after {reason} exit had no opening bar"
+            )
             return
         try:
             available = bar.available_volume()
         except CannotFill as exc:
             self.log(at, key, exc.code, f"{reason} exit: {exc}")
+            if exc.code in {"missing_open_price", "missing_open_volume"}:
+                self.halt_entries_for_data(
+                    at, key, f"new entries halted after {reason} exit lacked opening evidence"
+                )
             return
         if not available:
             self.log(at, key, f"{reason}_unfilled", "forced exit has no remaining opening volume")
@@ -391,6 +449,9 @@ class _Engine:
             if bar.price is None:
                 if bracket.triggered_stop:
                     self.log(at, key, "missing_open_price", "pending stop has no opening price")
+                    self.halt_entries_for_data(
+                        at, key, "new entries halted after a triggered stop lacked opening evidence"
+                    )
                 return
             check_stop = check_target = bar.price
         else:
@@ -440,6 +501,10 @@ class _Engine:
             available = bar.available_volume() if isinstance(bar, OpeningBar) else bar.remaining
         except CannotFill as exc:
             self.log(at, key, exc.code, f"{reason} exit: {exc}", bracket.entry.order_id)
+            if exc.code in {"missing_open_price", "missing_open_volume"}:
+                self.halt_entries_for_data(
+                    at, key, f"new entries halted after {reason} exit lacked opening evidence"
+                )
             return
         if not available:
             interval = "opening" if opening else "intrabar"
@@ -478,6 +543,11 @@ class _Engine:
         target: Decimal | None = None
         try:
             if isinstance(request, RollRequest):
+                if self.risk_gate is not None:
+                    raise CannotFill(
+                        "risk_limited_roll",
+                        "risk-limited rolls require a destination-contract protective stop",
+                    )
                 old, new = legs
                 if (
                     signed(request.signal.side, self.portfolio.quantity(old.contract))
@@ -503,6 +573,12 @@ class _Engine:
                 old_qty = self.portfolio.quantity(key)
                 new_qty = old_qty + signed(order.side, order.quantity)
                 opens = new_qty != 0 and (old_qty * new_qty <= 0 or abs(new_qty) > abs(old_qty))
+                if opens and self.risk_gate is not None:
+                    blocked = self.risk_gate.blocked_entry(
+                        order.instrument_id, order.contract_month
+                    )
+                    if blocked is not None:
+                        raise CannotFill(*blocked)
                 if opens and key in bucket.expires:
                     raise CannotFill("expiry", "cannot open exposure in the final trading bar")
                 if opens and key in self.brackets:
@@ -532,17 +608,17 @@ class _Engine:
                             "invalid_time_exit",
                             "timed exit must be a later opening in the entry session",
                         )
-                    if levels or distance is not None or target_distance is not None:
+                    risk_check = self.risk_gate is not None and opens and not request.reduce_only
+                    row = None
+                    if levels or distance is not None or target_distance is not None or risk_check:
                         row = quote(order, bar, price, at, self.schedules)
                         if distance is not None:
-                            long = order.side == "buy"
-                            level = row.price - distance if long else row.price + distance
-                            rounding = ROUND_CEILING if long else ROUND_FLOOR
-                            stop = (level / bar.tick).to_integral_value(
-                                rounding=rounding
-                            ) * bar.tick
-                            if stop <= 0:
-                                raise CannotFill("invalid_bracket", "stop must be positive")
+                            try:
+                                stop = stop_from_distance(
+                                    row.price, order.side, distance, Decimal(bar.tick)
+                                )
+                            except ValueError as exc:
+                                raise CannotFill("invalid_bracket", str(exc)) from exc
                         if target_distance is not None:
                             long = order.side == "buy"
                             level = (
@@ -562,13 +638,56 @@ class _Engine:
                                 "invalid_bracket",
                                 "entry open or fill is outside its protective levels",
                             )
+                        if risk_check:
+                            assert self.risk_gate is not None
+                            risk_amount = (
+                                stop_loss_amount(row.price, stop, order.quantity, bar.multiplier)
+                                if stop is not None
+                                else None
+                            )
+                            if risk_amount is not None:
+                                assert stop is not None
+                                costs = self.schedules.cost_at(
+                                    order.instrument_id, bar.session.trade_date
+                                )
+                                if costs is None:
+                                    raise CannotFill(
+                                        "missing_cost", "no effective stop-exit cost schedule"
+                                    )
+                                exit_side = other(order.side)
+                                slip_points = Decimal(bar.tick * costs.slippage_ticks)
+                                exit_price = (
+                                    stop + slip_points if exit_side == "buy" else stop - slip_points
+                                )
+                                if exit_price <= 0:
+                                    raise CannotFill(
+                                        "invalid_risk_estimate",
+                                        "estimated stop exit price is non-positive",
+                                    )
+                                units = bar.multiplier * order.quantity
+                                risk_amount += (
+                                    row.broker_fee
+                                    + row.tax
+                                    + costs.broker_fee_per_contract * order.quantity
+                                    + exit_price * units * costs.tax_rate
+                                    + slip_points * units
+                                )
+                            error = self.risk_gate.trade_risk_error(
+                                risk_amount, self.portfolio.cash + self.portfolio.unrealized
+                            )
+                            if error is not None:
+                                raise CannotFill(*error)
                 quoted.append((order, bar, price))
             reduce_only = isinstance(request, OrderRequest) and request.reduce_only
             max_exposure = (
                 request.max_instrument_exposure if isinstance(request, OrderRequest) else None
             )
             fills = self.execute(
-                tuple(quoted), at, reduce_only=reduce_only, max_instrument_exposure=max_exposure
+                tuple(quoted),
+                at,
+                reduce_only=reduce_only,
+                max_instrument_exposure=max_exposure,
+                risk_request=request if self.risk_gate is not None else None,
             )
             if (
                 isinstance(request, OrderRequest)
@@ -581,11 +700,44 @@ class _Engine:
                 )
             ):
                 entry = legs[0]
-                self.brackets[entry.contract] = _Bracket(entry, fills[0].fill_at, stop, target)
+                self.brackets[entry.contract] = _Bracket(
+                    entry, request.signal.strategy_id, fills[0].fill_at, stop, target
+                )
                 if request.exit_at is not None and self.includes(request.exit_at + AFTER):
                     self.schedule_through(request.exit_at)
                     self.bucket(request.exit_at).timed_exits.add((entry.contract, entry.order_id))
         except CannotFill as exc:
+            if (
+                self.risk_gate is not None
+                and exc.code
+                in {
+                    "calendar_gap",
+                    "incomplete_bar",
+                    "invalid_open_volume",
+                    "invalid_volume",
+                    "missing_open",
+                    "missing_open_price",
+                    "missing_open_volume",
+                    "unknown_trading_status",
+                }
+                and self.risk_gate.halt_data(
+                    request.signal.instrument_id,
+                    request.contract_month
+                    if isinstance(request, OrderRequest)
+                    else request.to_contract_month,
+                )
+            ):
+                self.log(
+                    at,
+                    (
+                        request.signal.instrument_id,
+                        request.contract_month
+                        if isinstance(request, OrderRequest)
+                        else request.to_contract_month,
+                    ),
+                    "data_kill_switch",
+                    f"new entries halted after invalid or missing data: {exc.code}",
+                )
             for order in legs:
                 self.record_failure(at, order, exc)
 
@@ -635,7 +787,8 @@ class _Engine:
                     del self.unsettled[key]
             if quantity:
                 pnl = self.portfolio.settle(event, multiplier, broker_fee, tax)
-                self.mark_times[key] = (at, False)
+                # Official settlement wins over a late bar with the same event timestamp.
+                self.mark_times[key] = (at, False, 1)
                 self.settlements.append(
                     SettlementRecord(
                         event=event,
@@ -679,6 +832,10 @@ class _Engine:
                 bar = opening_bar(feature, self.calendar)
             except CannotFill as exc:
                 self.log(start, key, exc.code, str(exc))
+                if self.risk_gate is not None:
+                    self.bucket(start).data_errors.append(
+                        (key, f"new entries halted after invalid opening data: {exc.code}")
+                    )
                 continue
             self.bucket(start).opens[key] = bar
             if complete:
@@ -762,6 +919,8 @@ class _Engine:
         while self.clock:
             at = heappop(self.clock)
             bucket = self.buckets.pop(at)
+            for key, detail in bucket.data_errors:
+                self.halt_entries_for_data(at, key, detail)
             features = []
             for feature, opened in sorted(
                 bucket.features, key=lambda item: (item[0].bar_end, item[1].key)
@@ -770,7 +929,17 @@ class _Engine:
                     bar = executable_bar(feature, self.calendar, opened=opened)
                 except CannotFill as exc:
                     self.log(at, opened.key, exc.code, str(exc))
+                    self.halt_entries_for_data(
+                        at, opened.key, f"new entries halted after invalid feature data: {exc.code}"
+                    )
                     continue
+                self.advance_trade_date(feature.trade_date)
+                if self.risk_gate is not None and self.risk_gate.observe_feature(feature):
+                    self.halt_entries_for_data(
+                        at,
+                        (feature.instrument_id, feature.contract_month or ""),
+                        "new entries halted after a missing intraday bar",
+                    )
                 features.append(feature)
                 self.valid_features.add(
                     (feature.instrument_id, feature.contract_month or "", feature.bar_start)
@@ -801,6 +970,7 @@ class _Engine:
                         "ambiguous simultaneous settlement prices",
                     )
             for key, day, final in bucket.daily:
+                self.advance_trade_date(day)
                 if self.portfolio.quantity(key) and (key, day) not in self.settled:
                     self.unsettled.setdefault(key, set()).add(day)
                     if not final:
@@ -853,6 +1023,22 @@ class _Engine:
                 continue
             had_margin_call = self.margin_call
             for _, opened in sorted(bucket.opens.items()):
+                self.advance_trade_date(opened.session.trade_date)
+                if self.risk_gate is not None:
+                    if opened.price is None or opened.volume is None:
+                        self.halt_entries_for_data(
+                            at, opened.key, "new entries halted after opening evidence was missing"
+                        )
+                    elif self.risk_gate.observe_open(
+                        opened.key[0],
+                        opened.key[1],
+                        opened.session.kind,
+                        opened.session.trade_date,
+                        at,
+                    ):
+                        self.halt_entries_for_data(
+                            at, opened.key, "new entries halted after a missing intraday bar"
+                        )
                 if opened.price is not None:
                     self.mark(opened.key, opened.price, opened.multiplier, at, opening=True)
             self.snapshot(fill_at)
@@ -877,6 +1063,7 @@ class _Engine:
                             "timed exit left exposure open",
                             entry_id,
                         )
+            self.snapshot(fill_at)
             for request, legs in sorted(bucket.eligible, key=lambda row: row[1][0].order_id):
                 if had_margin_call:
                     self.margin_call = True
@@ -936,8 +1123,9 @@ def run_backtest(
     settlements: Iterable[SettlementEvent] = (),
     on_feature: Features | None = None,
     on_feature_with_positions: PositionFeatures | None = None,
+    risk_limits: RiskLimits | None = None,
 ) -> BacktestResult:
-    """Replay market bars and optional callback-only decisions reproducibly before a cutoff."""
+    """Replay bars; pass risk_limits to enforce independent account risk checks."""
     if not isinstance(initial_cash, Decimal) or not initial_cash.is_finite() or initial_cash < 0:
         raise ValueError("initial_cash must be a finite, non-negative Decimal")
     with localcontext(Context(prec=50)):
@@ -946,6 +1134,7 @@ def run_backtest(
             schedules,
             initial_cash,
             _taipei_datetime(before) if before is not None else None,
+            risk_limits,
         )
         engine.prepare(bars, opening_only_bars, decision_features, orders, settlements)
         return engine.run(on_feature, on_feature_with_positions)

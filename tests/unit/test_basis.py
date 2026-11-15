@@ -294,7 +294,7 @@ def test_basis_backtest_uses_reduce_only_mean_exit_and_price_baseline(calendar) 
         },
     )
 
-    result = compare_basis(spots, futures, carry_by_bar, calendar, schedules, D(100000))
+    result = compare_basis(spots, futures, carry_by_bar, calendar, schedules, D(1000000))
 
     assert [fill.reason for fill in result.basis.fills] == ["signal", "signal"]
     assert {fill.contract_month for fill in result.basis.fills} == {MONTH}
@@ -418,7 +418,7 @@ def test_late_spot_decision_preserves_timely_futures_stop(calendar) -> None:
         },
     )
 
-    result = compare_basis(spots, futures, carry_by_bar, calendar, schedules, D(100000)).basis
+    result = compare_basis(spots, futures, carry_by_bar, calendar, schedules, D(1000000)).basis
 
     assert [fill.reason for fill in result.fills] == ["signal", "stop"]
     assert result.fills[0].signal_at == starts[-3] + timedelta(minutes=8)

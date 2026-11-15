@@ -1042,6 +1042,25 @@ def test_repeated_settlements_are_one_audit_and_never_mark_to_market(calendar, s
     assert result.snapshots[-1].cash == D("9782.996")
 
 
+def test_late_bar_cannot_override_same_time_settlement_mark(calendar, schedules) -> None:
+    event = SettlementEvent(
+        instrument_id="TX", contract_month=NOV, trade_date=DAY, available_at=at(13, 45), price=1010
+    )
+    result = run_backtest(
+        calendar,
+        schedules,
+        D(10000),
+        [bar(at(13, 40), 1000, low=930, high=1010, close=940, delay=78)],
+        orders=[order("entry", at(13, 40), "buy")],
+        settlements=[event],
+    )
+
+    settlement = next(row for row in result.snapshots if row.snapshot_at == at(13, 45))
+
+    assert result.snapshots[-1].snapshot_at == at(15, 3)
+    assert result.snapshots[-1].equity == settlement.equity
+
+
 def test_late_revision_of_execution_bar_aborts_run_before_callbacks(calendar, schedules) -> None:
     original = bar(at(9, 0), 1000)
     revised = bar(at(9, 0), 1005, delay=15)

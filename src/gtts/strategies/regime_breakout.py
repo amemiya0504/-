@@ -12,6 +12,7 @@ from gtts.engine.backtest import run_backtest
 from gtts.engine.broker import INTERVAL, CannotFill, executable_bar
 from gtts.engine.events import BacktestResult, OrderRequest, Side
 from gtts.features.volatility import breakout_features, donchian_channel
+from gtts.risk.limits import RiskLimits
 from gtts.risk.margin import Schedules
 
 STOP_ATR = Decimal("1.5")
@@ -144,6 +145,7 @@ def _run_policy(
         bars,
         before=before,
         on_feature_with_positions=decide,
+        risk_limits=RiskLimits(),
     )
 
 

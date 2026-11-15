@@ -417,7 +417,7 @@ def test_oos_uses_observed_exit_open_without_post_cutoff_data(
             ("time_exit", 1050),
         ]
         assert result.fills[-1].fill_at == at(13, 13, 40) + timedelta(microseconds=1)
-        assert not result.audit
+        assert [row.code for row in result.audit] == ["data_kill_switch"]
         assert result.snapshots[-1].snapshot_at < cutoff
 
 

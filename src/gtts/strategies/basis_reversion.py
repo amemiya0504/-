@@ -20,6 +20,7 @@ from gtts.features.basis import (
     past_zscore,
 )
 from gtts.features.volatility import atr14
+from gtts.risk.limits import RiskLimits
 from gtts.risk.margin import Schedules
 
 ENTRY_Z = Decimal("2.0")
@@ -181,6 +182,7 @@ def _run_policy(
         before=before,
         on_feature_with_positions=decide,
         decision_features=delayed_decisions,
+        risk_limits=RiskLimits(),
     )
 
 
