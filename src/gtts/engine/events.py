@@ -17,7 +17,7 @@ from gtts.data.schema import (
 
 Contract = tuple[str, str]
 Side = Literal["buy", "sell"]
-Reason = Literal["signal", "roll", "stop", "target", "margin", "expiry"]
+Reason = Literal["signal", "roll", "stop", "target", "time_exit", "margin", "expiry"]
 
 
 class OrderRequest(Schema):
@@ -25,17 +25,28 @@ class OrderRequest(Schema):
     contract_month: str = Field(min_length=1)
     quantity: int = Field(gt=0)
     stop_price: Decimal | None = Field(default=None, gt=0)
+    stop_distance: Decimal | None = Field(default=None, gt=0)
     target_price: Decimal | None = Field(default=None, gt=0)
+    exit_at: datetime | None = None
+
+    @field_validator("exit_at")
+    @classmethod
+    def exit_uses_taipei(cls, value: datetime | None) -> datetime | None:
+        return _taipei_datetime(value) if value is not None else None
 
     @model_validator(mode="after")
     def validate_bracket(self) -> Self:
         stop, target = self.stop_price, self.target_price
+        if stop is not None and self.stop_distance is not None:
+            raise ValueError("specify either a stop price or a distance from entry")
         if (
             stop is not None
             and target is not None
             and (not stop < target if self.signal.side == "buy" else not stop > target)
         ):
             raise ValueError("stop and target must be in the correct order for the entry side")
+        if self.exit_at is not None and self.exit_at <= self.signal.decision_at:
+            raise ValueError("timed exit must be later than the entry decision")
         return self
 
 

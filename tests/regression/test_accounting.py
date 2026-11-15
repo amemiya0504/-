@@ -1,8 +1,9 @@
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, localcontext
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from gtts.data.calendar import TradingCalendar
 from gtts.data.quality import FeatureEvent
@@ -30,6 +31,7 @@ def bar(
     high: int | None = None,
     close: int | None = None,
     volume: int = 10,
+    opening_volume: int | None = None,
     trade_date: date | None = None,
     night: bool = False,
     delay: int = 0,
@@ -43,6 +45,9 @@ def bar(
         bar_start=start,
         bar_end=end,
         available_at=end + timedelta(minutes=delay),
+        open_price_available_at=start,
+        open_volume=volume if opening_volume is None else opening_volume,
+        open_volume_available_at=start,
         values={
             "open": price,
             "high": high or price,
@@ -51,6 +56,10 @@ def bar(
             "volume": volume,
         },
     )
+
+
+def without_open_volume(row: FeatureEvent) -> FeatureEvent:
+    return row.model_copy(update={"open_volume": None, "open_volume_available_at": None})
 
 
 def signal(tag: str, decision: datetime, side: Side) -> SignalEvent:
@@ -72,15 +81,581 @@ def order(
     quantity: int = 1,
     month: str = NOV,
     stop: int | None = None,
+    stop_distance: Decimal | None = None,
     target: int | None = None,
+    exit_at: datetime | None = None,
 ) -> OrderRequest:
     return OrderRequest(
         signal=signal(tag, decision, side),
         contract_month=month,
         quantity=quantity,
         stop_price=stop,
+        stop_distance=stop_distance,
         target_price=target,
+        exit_at=exit_at,
     )
+
+
+def test_timed_exit_requires_a_filled_entry_and_uses_same_session_open(calendar, schedules) -> None:
+    entry = bar(at(9, 5), 1000)
+    close = bar(at(13, 40), 1020, low=1010, close=1010)
+    request = order("timed", at(9, 5), "buy", exit_at=at(13, 40))
+    result = run_backtest(calendar, schedules, D(10000), [entry, close], orders=[request])
+    assert [(fill.reason, fill.reference_price) for fill in result.fills] == [
+        ("signal", D(1000)),
+        ("time_exit", D(1020)),
+    ]
+    assert result.fills[1].fill_at == at(13, 40) + timedelta(microseconds=1)
+    assert not result.snapshots[-1].positions
+    rejected = run_backtest(
+        calendar, schedules, D(10000), [bar(at(9, 5), 1000, volume=0), close], orders=[request]
+    )
+    assert not rejected.fills
+    assert [audit.code for audit in rejected.audit] == ["insufficient_volume"]
+
+
+def test_total_bar_volume_cannot_authorize_exact_opening_fills(calendar, schedules) -> None:
+    request = order("opening", at(9, 5), "buy", quantity=2)
+    for volume in (1, 2):
+        no_open = without_open_volume(bar(at(9, 5), 1000, volume=volume))
+        result = run_backtest(calendar, schedules, D(10000), [no_open], orders=[request])
+        assert not result.fills
+        assert [row.code for row in result.audit] == ["missing_open_volume"]
+
+    entry = bar(at(9, 5), 1000, volume=2)
+    data = entry.model_dump()
+    data["open_volume_available_at"] = entry.bar_end
+    with pytest.raises(ValidationError, match="available by the five-minute bar start"):
+        FeatureEvent.model_validate(data)
+    late = entry.model_copy(update={"open_volume_available_at": entry.bar_end})
+    no_timestamp = entry.model_copy(update={"open_volume_available_at": None})
+    no_volume = entry.model_copy(update={"open_volume": None})
+    implicit = without_open_volume(entry).model_copy(
+        update={"values": {**entry.values, "open_volume": 2}}
+    )
+    for invalid in (late, no_timestamp, no_volume, implicit):
+        result = run_backtest(calendar, schedules, D(10000), [invalid], orders=[request])
+        assert not result.fills
+        assert [row.code for row in result.audit] == ["missing_open_volume"]
+    zero_open = entry.model_copy(update={"open_volume": 0})
+    result = run_backtest(calendar, schedules, D(10000), [zero_open], orders=[request])
+    assert not result.fills
+    assert [row.code for row in result.audit] == ["insufficient_volume"]
+    verified = run_backtest(calendar, schedules, D(10000), [entry], orders=[request])
+    assert [fill.quantity for fill in verified.fills] == [2]
+
+
+def test_opening_capacity_cannot_substitute_for_price_availability(calendar, schedules) -> None:
+    entry = bar(at(9, 5), 1000)
+    data = entry.model_dump()
+    data["open_price_available_at"] = entry.bar_end
+    with pytest.raises(ValidationError, match="open price must be available"):
+        FeatureEvent.model_validate(data)
+    for timestamp in (None, entry.bar_end):
+        unpriced = entry.model_copy(update={"open_price_available_at": timestamp})
+        result = run_backtest(
+            calendar, schedules, D(10000), [unpriced], orders=[order("entry", at(9, 5), "buy")]
+        )
+        assert not result.fills
+        assert [row.code for row in result.audit] == ["missing_open_price"]
+
+
+@pytest.mark.parametrize(
+    "field,code",
+    [
+        ("open_price_available_at", "missing_open_price"),
+        ("open_volume_available_at", "missing_open_volume"),
+    ],
+)
+def test_malformed_opening_evidence_fails_closed(calendar, schedules, field, code) -> None:
+    entry = bar(at(9, 5), 1000)
+    for invalid in ("not a datetime", 1, entry.bar_start.astimezone(UTC)):
+        injected = entry.model_copy(update={field: invalid})
+        result = run_backtest(
+            calendar, schedules, D(10000), [injected], orders=[order("entry", at(9, 5), "buy")]
+        )
+        assert not result.fills
+        assert [(row.at, row.code) for row in result.audit] == [
+            (at(9, 5) + timedelta(microseconds=1), code)
+        ]
+
+
+@pytest.mark.parametrize(
+    "late_values,issue",
+    [
+        ({"close": 9999}, "invalid_price"),
+        ({"high": None}, "incomplete_bar"),
+        ({"low": 1030}, "invalid_price"),
+        ({"volume": 0}, "invalid_open_volume"),
+        ({"halted": 2}, "unknown_trading_status"),
+        ({"halted": 1}, None),
+    ],
+)
+def test_late_completed_data_cannot_cancel_an_observed_open(
+    calendar,
+    schedules,
+    late_values,
+    issue,
+) -> None:
+    shifted = bar(at(9, 10), 1020, delay=2)
+    shifted = shifted.model_copy(update={"values": {**shifted.values, **late_values}})
+    result = run_backtest(
+        calendar,
+        schedules,
+        D(2700),
+        [bar(at(9, 5), 1000), shifted, bar(at(9, 10), 1000, month=DEC)],
+        orders=[order("held", at(9, 5), "buy"), order("new", at(9, 10), "buy", month=DEC)],
+    )
+    assert [fill.signal_id for fill in result.fills] == ["held", "new"]
+    row = next(
+        row for row in result.snapshots if row.snapshot_at == at(9, 10) + timedelta(microseconds=1)
+    )
+    assert row.unrealized == 4000
+    assert [(entry.at, entry.code) for entry in result.audit] == (
+        [(at(9, 17), issue)] if issue else []
+    )
+
+
+def test_late_bad_full_bar_cannot_cancel_a_verified_gap_stop(calendar, schedules) -> None:
+    gap = bar(at(9, 10), 980, delay=2)
+    gap = gap.model_copy(update={"values": {**gap.values, "close": None}})
+    result = run_backtest(
+        calendar,
+        schedules,
+        D(10000),
+        [bar(at(9, 5), 1000), gap],
+        orders=[order("held", at(9, 5), "buy", stop=990)],
+    )
+    assert [(row.reason, row.reference_price) for row in result.fills] == [
+        ("signal", 1000),
+        ("stop", 980),
+    ]
+    assert result.fills[-1].fill_at == at(9, 10) + timedelta(microseconds=1)
+    assert [(row.at, row.code) for row in result.audit] == [(at(9, 17), "incomplete_bar")]
+
+
+def test_late_intrabar_data_cannot_backfill_a_stop(calendar, schedules) -> None:
+    tardy = bar(at(9, 10), 1000, low=980, opening_volume=1, delay=2)
+    result = run_backtest(
+        calendar,
+        schedules,
+        D(10000),
+        [bar(at(9, 5), 1000), tardy, bar(at(9, 15), 1010)],
+        orders=[order("held", at(9, 5), "buy", stop=990)],
+    )
+    assert [(fill.signal_id, fill.reason) for fill in result.fills] == [("held", "signal")]
+    assert [(entry.at, entry.code) for entry in result.audit] == [(at(9, 17), "late_intrabar_bar")]
+    late_snapshot = next(row for row in result.snapshots if row.snapshot_at == at(9, 17))
+    assert late_snapshot.positions == {"TX:202611": 1}
+    assert late_snapshot.unrealized == 2000
+
+
+def test_late_intrabar_data_audited_even_after_historical_bracket_is_closed(
+    calendar, schedules
+) -> None:
+    tardy = bar(at(9, 5), 1000, low=980, opening_volume=1, delay=7)
+    result = run_backtest(
+        calendar,
+        schedules,
+        D(10000),
+        [bar(at(9, 0), 1000), tardy, bar(at(9, 10), 1000)],
+        orders=[order("held", at(9, 0), "buy", stop=990), order("close", at(9, 10), "sell")],
+    )
+    assert [(fill.signal_id, fill.reason) for fill in result.fills] == [
+        ("held", "signal"),
+        ("close", "signal"),
+    ]
+    assert [(row.at, row.code) for row in result.audit] == [(at(9, 17), "late_intrabar_bar")]
+    assert not result.snapshots[-1].positions
+
+
+def test_open_capacity_is_shared_without_disabling_intrabar_stop(calendar, schedules) -> None:
+    entry = bar(at(9, 5), 1000, low=980, volume=3).model_copy(update={"open_volume": 1})
+    result = run_backtest(
+        calendar,
+        schedules,
+        D(10000),
+        [entry],
+        orders=[order("a", at(9, 5), "buy", stop=990), order("b", at(9, 5), "buy", month=NOV)],
+    )
+    assert [(fill.reason, fill.reference_price) for fill in result.fills] == [
+        ("signal", D(1000)),
+        ("stop", D(990)),
+    ]
+    assert result.fills[-1].fill_at == at(9, 10) - timedelta(microseconds=1)
+    # The same contract's live bracket precludes adding exposure even without the volume limit.
+    ordinary = run_backtest(
+        calendar,
+        schedules,
+        D(10000),
+        [entry],
+        orders=[order(name, at(9, 5), "buy") for name in ("a", "b")],
+    )
+    assert [fill.signal_id for fill in ordinary.fills] == ["a"]
+    assert [row.code for row in ordinary.audit] == ["insufficient_volume"]
+
+
+def test_opening_stop_and_timed_exit_require_open_volume(calendar, schedules) -> None:
+    entry = bar(at(9, 5), 1000)
+    gap = without_open_volume(bar(at(9, 10), 980, volume=0))
+    timed = without_open_volume(bar(at(13, 40), 1000))
+    result = run_backtest(
+        calendar,
+        schedules,
+        D(10000),
+        [entry, gap, timed],
+        orders=[order("entry", at(9, 5), "buy", stop=990, exit_at=at(13, 40))],
+    )
+    assert [fill.reason for fill in result.fills] == ["signal"]
+    assert result.snapshots[-1].positions == {"TX:202611": 1}
+    missing = [row for row in result.audit if row.code == "missing_open_volume"]
+    assert {(row.at, row.detail.split()[0]) for row in missing} == {
+        (at(9, 10) + timedelta(microseconds=1), "stop"),
+        (at(13, 40) + timedelta(microseconds=1), "time_exit"),
+    }
+    assert "time_exit_unresolved" in {row.code for row in result.audit}
+
+    intrabar = without_open_volume(bar(at(9, 10), 980, low=970))
+    coarse = run_backtest(
+        calendar,
+        schedules,
+        D(10000),
+        [entry, intrabar],
+        orders=[order("entry", at(9, 5), "buy", stop=990)],
+    )
+    assert [fill.reason for fill in coarse.fills] == ["signal"]
+    assert [
+        (row.at, row.code) for row in coarse.audit if row.code == "unknown_intrabar_extrema"
+    ] == [(at(9, 15), "unknown_intrabar_extrema")]
+
+
+@pytest.mark.parametrize("opening,stop,target", [(1030, None, 1020), (980, 990, None)])
+@pytest.mark.parametrize(
+    "evidence", [{"open_price_available_at": None}, {"open_volume": None}, {"open_volume": 0}]
+)
+def test_unverified_opening_extreme_cannot_activate_an_intrabar_bracket(
+    calendar,
+    schedules,
+    opening,
+    stop,
+    target,
+    evidence,
+) -> None:
+    extrema = bar(
+        at(9, 10),
+        opening,
+        low=min(opening, 1000),
+        high=max(opening, 1000),
+        close=1000,
+        volume=2,
+        opening_volume=1,
+    ).model_copy(update=evidence)
+    result = run_backtest(
+        calendar,
+        schedules,
+        D(10000),
+        [bar(at(9, 5), 1000), extrema, bar(at(9, 15), 1010)],
+        orders=[order("held", at(9, 5), "buy", stop=stop, target=target)],
+    )
+    assert [fill.reason for fill in result.fills] == ["signal"]
+    assert result.snapshots[-1].positions == {"TX:202611": 1}
+    assert [
+        (row.at, row.code) for row in result.audit if row.code == "unknown_intrabar_extrema"
+    ] == [(at(9, 15), "unknown_intrabar_extrema")]
+
+
+def test_verified_opening_extreme_alone_does_not_retry_a_target_intrabar(
+    calendar,
+    schedules,
+) -> None:
+    gap = bar(at(9, 10), 1030, low=1000, close=1000, volume=3, opening_volume=1)
+    result = run_backtest(
+        calendar,
+        schedules,
+        D(10000),
+        [bar(at(9, 5), 1000), gap],
+        orders=[order("held", at(9, 5), "buy", quantity=2, target=1020)],
+    )
+    assert [fill.reason for fill in result.fills] == ["signal"]
+    assert result.snapshots[-1].positions == {"TX:202611": 2}
+    assert [(row.at, row.code) for row in result.audit] == [
+        (at(9, 10) + timedelta(microseconds=1), "insufficient_volume"),
+    ]
+
+
+@pytest.mark.parametrize("opening_volume", [None, 0])
+def test_carried_opening_price_does_not_trigger_pending_stop(
+    calendar,
+    schedules,
+    opening_volume,
+) -> None:
+    carry = bar(at(9, 10), 980, volume=0).model_copy(update={"open_volume": opening_volume})
+    result = run_backtest(
+        calendar,
+        schedules,
+        D(10000),
+        [bar(at(9, 5), 1000), carry, bar(at(9, 15), 1010)],
+        orders=[order("entry", at(9, 5), "buy", stop=990)],
+    )
+    assert [fill.reason for fill in result.fills] == ["signal"]
+    assert result.snapshots[-1].positions == {"TX:202611": 1}
+
+
+def test_intrabar_capacity_excludes_all_observed_opening_volume(calendar, schedules) -> None:
+    result = run_backtest(
+        calendar,
+        schedules,
+        D(50000),
+        [bar(at(9, 5), 1000), bar(at(9, 10), 1000, low=980, volume=10, opening_volume=9)],
+        orders=[order("entry", at(9, 5), "buy", quantity=5, stop=990)],
+    )
+    assert [(fill.reason, fill.quantity) for fill in result.fills] == [("signal", 5), ("stop", 1)]
+    assert result.snapshots[-1].positions == {"TX:202611": 4}
+    assert [row.code for row in result.audit] == ["stop_partial"]
+
+
+@pytest.mark.parametrize(
+    "opening_volume,code", [(None, "missing_open_volume"), (0, "insufficient_volume")]
+)
+def test_open_mark_without_opening_capacity_does_not_allow_trades(
+    calendar,
+    schedules,
+    opening_volume,
+    code,
+) -> None:
+    gap = bar(at(9, 10), 1020).model_copy(update={"open_volume": opening_volume})
+    result = run_backtest(
+        calendar,
+        schedules,
+        D(10000),
+        [bar(at(9, 5), 1000), gap],
+        orders=[
+            order("entry", at(9, 5), "buy"),
+            order("new", at(9, 10), "buy"),
+            order("exit", at(9, 10), "sell"),
+        ],
+    )
+    assert [fill.signal_id for fill in result.fills] == ["entry"]
+    snapshot = next(
+        row for row in result.snapshots if row.snapshot_at == at(9, 10) + timedelta(microseconds=1)
+    )
+    assert snapshot.positions == {"TX:202611": 1}
+    assert snapshot.equity - snapshot.cash == 4000
+    assert {(row.order_id, row.code) for row in result.audit} == {
+        ("new:order", code),
+        ("exit:order", code),
+    }
+
+
+def test_later_bar_volume_cannot_change_earlier_marks_or_margin_decisions(
+    calendar, schedules
+) -> None:
+    entry = bar(at(9, 5), 1000)
+    other_contract = bar(at(9, 10), 1000, month=DEC)
+    decisions = [order("held", at(9, 5), "buy"), order("new", at(9, 10), "buy", month=DEC)]
+    for volume in (0, 1):
+        gap = bar(at(9, 10), 1020, volume=volume, opening_volume=0, delay=2).model_copy(
+            update={"open_price_available_at": None}
+        )
+        result = run_backtest(
+            calendar, schedules, D(2700), [entry, gap, other_contract], orders=decisions
+        )
+        assert [row.signal_id for row in result.fills] == ["held"]
+        assert [(row.order_id, row.code) for row in result.audit if row.at < at(9, 15)] == [
+            ("new:order", "initial_margin")
+        ]
+        assert len([row for row in result.audit if row.code == "late_intrabar_bar"]) == volume
+        snapshots = {row.snapshot_at: row for row in result.snapshots}
+        assert snapshots[at(9, 10) + timedelta(microseconds=1)].unrealized == 0
+        assert snapshots[at(9, 15)].unrealized == 0
+        assert snapshots[at(9, 17)].unrealized == 4000 * volume
+
+
+def test_completed_bar_volume_cannot_trigger_a_stop_at_an_unverified_open(
+    calendar, schedules
+) -> None:
+    entry = bar(at(9, 5), 1000)
+    request = order("held", at(9, 5), "buy", stop=990)
+    for volume in (0, 1):
+        gap = bar(at(9, 10), 980, volume=volume, opening_volume=0).model_copy(
+            update={"open_price_available_at": None}
+        )
+        result = run_backtest(calendar, schedules, D(10000), [entry, gap], orders=[request])
+        opening_at = at(9, 10) + timedelta(microseconds=1)
+        snapshot = next(row for row in result.snapshots if row.snapshot_at == opening_at)
+        assert snapshot.unrealized == 0
+        assert [(row.fill_at, row.reason) for row in result.fills if row.fill_at <= opening_at] == [
+            (at(9, 5) + timedelta(microseconds=1), "signal")
+        ]
+        assert not any(row.at == opening_at for row in result.audit)
+        assert len(result.fills) == 1
+        assert (
+            len([row for row in result.audit if row.code == "unknown_intrabar_extrema"]) == volume
+        )
+
+
+def test_delayed_close_does_not_replace_a_newer_observed_open(calendar, schedules) -> None:
+    late = bar(at(9, 10), 1020, delay=2).model_copy(update={"open_price_available_at": None})
+    result = run_backtest(
+        calendar,
+        schedules,
+        D(10000),
+        [bar(at(9, 5), 1000), late, bar(at(9, 15), 1040)],
+        orders=[order("held", at(9, 5), "buy")],
+    )
+    snapshots = {row.snapshot_at: row for row in result.snapshots}
+    assert snapshots[at(9, 10) + timedelta(microseconds=1)].unrealized == 0
+    assert snapshots[at(9, 15) + timedelta(microseconds=1)].unrealized == 8000
+    assert snapshots[at(9, 17)].unrealized == 8000
+
+
+def test_replay_cutoff_excludes_equal_time_prices_orders_and_features(calendar, schedules) -> None:
+    visible = []
+
+    def on_feature(feature: FeatureEvent):
+        visible.append(feature)
+        return ()
+
+    cutoff = at(9, 10)
+    result = run_backtest(
+        calendar,
+        schedules,
+        D(10000),
+        [bar(at(9, 5), 1000), bar(cutoff, 1020)],
+        before=cutoff,
+        orders=[
+            order("held", at(9, 5), "buy"),
+            order("queued", at(9, 6), "sell"),
+            order("late", cutoff, "sell"),
+        ],
+        on_feature=on_feature,
+    )
+    assert not visible
+    assert [row.signal_id for row in result.orders] == ["held", "queued"]
+    assert [row.signal_id for row in result.fills] == ["held"]
+    assert [(row.at, row.code) for row in result.audit] == [(at(9, 6), "outside_replay")]
+    assert all(row.snapshot_at < cutoff for row in result.snapshots)
+    assert result.snapshots[-1].equity == result.snapshots[-1].cash
+
+
+def test_margin_and_expiry_do_not_use_total_bar_volume_at_open(calendar, schedules) -> None:
+    margin = run_backtest(
+        calendar,
+        schedules,
+        D(2500),
+        [bar(at(9, 5), 1000, low=990, close=990), without_open_volume(bar(at(9, 10), 990))],
+        orders=[order("entry", at(9, 5), "buy")],
+    )
+    assert [fill.reason for fill in margin.fills] == ["signal"]
+    assert any(row.code == "missing_open_volume" and "margin" in row.detail for row in margin.audit)
+
+    expiry = run_backtest(
+        calendar,
+        schedules,
+        D(10000),
+        [bar(at(13, 20, 18), 1000), without_open_volume(bar(at(13, 25, 18), 1000))],
+        orders=[order("entry", at(13, 20, 18), "buy")],
+    )
+    assert [fill.reason for fill in expiry.fills] == ["signal"]
+    assert any(row.code == "missing_open_volume" and "expiry" in row.detail for row in expiry.audit)
+
+
+def test_timed_exit_is_canceled_after_stop_and_audits_missing_bar(calendar, schedules) -> None:
+    request = order("timed", at(9, 5), "buy", stop=990, exit_at=at(13, 40))
+    entry = bar(at(9, 5), 1000)
+    stop = bar(at(9, 10), 1000, low=980, opening_volume=1)
+    closed = run_backtest(calendar, schedules, D(10000), [entry, stop], orders=[request])
+    assert [fill.reason for fill in closed.fills] == ["signal", "stop"]
+    assert not any(audit.code.startswith("time_exit") for audit in closed.audit)
+
+    later = bar(at(15, 0), 1010, night=True, trade_date=date(2026, 11, 16))
+    missing = run_backtest(calendar, schedules, D(10000), [entry, later], orders=[request])
+    assert [fill.reason for fill in missing.fills] == ["signal"]
+    assert [a.at for a in missing.audit if a.code == "time_exit_unfilled"] == [
+        at(13, 40) + timedelta(microseconds=1)
+    ]
+    assert missing.snapshots[-1].positions == {"TX:202611": 1}
+
+
+def test_timed_exit_partial_liquidity_and_invalid_session(calendar, schedules) -> None:
+    entry = bar(at(9, 5), 1000, volume=2)
+    close = bar(at(13, 40), 1020, volume=1)
+    request = order("timed", at(9, 5), "buy", quantity=2, exit_at=at(13, 40))
+    result = run_backtest(calendar, schedules, D(10000), [entry, close], orders=[request])
+    assert [(f.reason, f.quantity) for f in result.fills] == [("signal", 2), ("time_exit", 1)]
+    assert [a.code for a in result.audit] == ["time_exit_partial", "time_exit_unresolved"]
+    assert result.snapshots[-1].positions == {"TX:202611": 1}
+    unavailable = run_backtest(
+        calendar, schedules, D(10000), [bar(at(9, 5), 1000, volume=1), close], orders=[request]
+    )
+    assert not unavailable.fills
+    assert [a.code for a in unavailable.audit] == ["insufficient_volume"]
+
+    overnight = order("timed", at(9, 5), "buy", exit_at=at(15, 0))
+    invalid = run_backtest(calendar, schedules, D(10000), [entry, close], orders=[overnight])
+    assert not invalid.fills
+    assert [a.code for a in invalid.audit] == ["invalid_time_exit"]
+
+
+@pytest.mark.parametrize(
+    "side,opening,fill_price,trigger_price,stop_extreme",
+    [("buy", 1020, 1021, 1014, {"low": 1013}), ("sell", 980, 979, 986, {"high": 987})],
+)
+def test_relative_stop_is_rounded_from_the_slipped_entry_fill(
+    calendar, schedules, side, opening, fill_price, trigger_price, stop_extreme
+) -> None:
+    request = order("atr", at(9, 5), side, stop_distance=D("1.5") * D("5.1"))
+    result = run_backtest(
+        calendar,
+        schedules,
+        D(10000),
+        [
+            bar(at(9, 0), 1000),
+            bar(at(9, 5), opening),
+            bar(at(9, 10), opening, opening_volume=1, **stop_extreme),
+        ],
+        orders=[request],
+    )
+    entry, stop = result.fills
+    assert (entry.reason, entry.price) == ("signal", fill_price)
+    assert (stop.reason, stop.reference_price) == ("stop", trigger_price)
+    assert abs(stop.reference_price - entry.price) == 7
+
+
+def test_missed_timed_exit_blocks_same_product_across_months_until_flat(
+    calendar, schedules
+) -> None:
+    entry = order("timed", at(9, 5), "buy", exit_at=at(13, 40))
+    blocked = order("blocked", at(9, 0, 16), "buy", month=DEC)
+    reduce = order("reduce", at(9, 5, 16), "sell")
+    allowed = order("allowed", at(9, 10, 16), "buy", month=DEC)
+    settle = SettlementEvent(
+        instrument_id="TX",
+        contract_month=NOV,
+        trade_date=DAY,
+        available_at=at(14, 0),
+        price=1000,
+    )
+    result = run_backtest(
+        calendar,
+        schedules,
+        D(10000),
+        [
+            bar(at(9, 5), 1000),
+            bar(at(9, 0, 16), 1020, month=DEC),
+            bar(at(9, 5, 16), 1000),
+            bar(at(9, 10, 16), 1010, month=DEC),
+        ],
+        orders=[entry, blocked, reduce, allowed],
+        settlements=[settle],
+    )
+    assert [row.signal_id for row in result.fills] == ["timed", "reduce", "allowed"]
+    assert [row.event for row in result.settlements] == [settle]
+    assert [(row.code, row.order_id, row.contract_month) for row in result.audit] == [
+        ("time_exit_unfilled", None, NOV),
+        ("time_exit_unresolved", "timed:order", NOV),
+        ("overdue_time_exit", "blocked:order", DEC),
+    ]
 
 
 @pytest.fixture
@@ -229,7 +804,7 @@ def test_golden_stop_gap_and_same_bar_oco(
         calendar,
         schedules,
         D(10000),
-        [bar(at(9, 0), 1000), bar(at(9, 5), opening, low=970, high=1030)],
+        [bar(at(9, 0), 1000), bar(at(9, 5), opening, low=970, high=1030, opening_volume=1)],
         orders=[order("entry", at(9, 0), "buy", stop=990, target=1020)],
     )
     assert [(fill.reason, fill.reference_price, fill.price) for fill in result.fills] == [
@@ -622,7 +1197,7 @@ def test_partial_stop_retries_at_next_open_even_after_price_recovers(calendar, s
         D(10000),
         [
             bar(at(9, 0), 1000, volume=2),
-            bar(at(9, 5), 995, low=989, volume=1),
+            bar(at(9, 5), 995, low=989, volume=2, opening_volume=1),
             bar(at(9, 10), 1001, volume=1),
         ],
         orders=[order("entry", at(9, 0), "buy", quantity=2, stop=990)],

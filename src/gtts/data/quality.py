@@ -23,6 +23,9 @@ class FeatureEvent(Schema):
     bar_start: datetime
     bar_end: datetime
     available_at: datetime
+    open_price_available_at: datetime | None = None
+    open_volume: int | None = Field(default=None, ge=0, strict=True)
+    open_volume_available_at: datetime | None = None
     values: dict[str, Decimal | int | None] = Field(default_factory=dict)
 
     @classmethod
@@ -36,12 +39,27 @@ class FeatureEvent(Schema):
     def timestamps_use_taipei(cls, value: datetime) -> datetime:
         return cls._validate_times(value)
 
+    @field_validator("open_price_available_at", "open_volume_available_at")
+    @classmethod
+    def opening_timestamp_uses_taipei(cls, value: datetime | None) -> datetime | None:
+        return cls._validate_times(value) if value is not None else None
+
     @model_validator(mode="after")
     def bar_is_complete(self) -> "FeatureEvent":
         if self.bar_end - self.bar_start != timedelta(minutes=5):
             raise ValueError("feature bar must span exactly five minutes")
         if self.available_at < self.bar_end:
             raise ValueError("feature is unavailable before the five-minute bar closes")
+        if (
+            self.open_price_available_at is not None
+            and self.open_price_available_at > self.bar_start
+        ):
+            raise ValueError("open price must be available by the five-minute bar start")
+        if (
+            self.open_volume_available_at is not None
+            and self.open_volume_available_at > self.bar_start
+        ):
+            raise ValueError("open volume must be available by the five-minute bar start")
         return self
 
 

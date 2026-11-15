@@ -1,6 +1,6 @@
 # GTTS：賽局理論 × 台指期量化研究系統
 
-專案提供台指期研究的時間契約、TX／MTX 交易日曆、TAIFEX／TWSE 日資料擷取，以及離線期貨回測核心。時間戳採 `Asia/Taipei`，研究訊號只能使用決策時間前已可得的資料。策略與券商下單不在目前範圍。
+專案提供台指期研究的時間契約、TX／MTX 交易日曆、TAIFEX／TWSE 日資料擷取、離線期貨回測，以及 S1 法人貝氏訊號與基準策略。時間戳採 `Asia/Taipei`，研究訊號只能使用決策時已可得的資料。系統限於研究與紙上模擬。
 
 ## 離線 smoke
 
@@ -28,3 +28,5 @@ uv run python scripts/ingest_daily.py --live --date 2026-11-13 --database data/g
 日曆覆蓋期間與來源、資料欄位、已知缺口見 [假設與待確認事項](docs/assumptions.md) 和 [資料字典](docs/data_dictionary.md)。
 
 離線模擬的撮合、結算、費稅與保證金輸入見 [回測協定](docs/backtest_protocol.md)。成本與保證金設定預設留空，回歸測試使用人工數值，沒有歷史績效結果。
+
+S1 的資料、校準、成本與退出規則見 [S1 法人貝氏訊號](docs/backtest_protocol.md#s1-法人貝氏訊號)。可跑 `uv run pytest tests/unit/test_institutional.py` 重現合成資料的 OOS 流程。
