@@ -1,0 +1,4 @@
+# No verified historical broker quote, cost policy or account margin schedule supplied.
+# See docs/backtest_protocol.md for the required effective-dated fields.
+costs: {}
+margins: {}

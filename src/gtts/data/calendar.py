@@ -161,6 +161,10 @@ class TradingCalendar(Schema):
             return None
         return self.last_trade_date(instrument, contract_month)
 
+    def is_last_trade_date(self, instrument: str, contract_month: str, day: date) -> bool:
+        self._require_covered(day)
+        return self._expiry_as_of(instrument, contract_month, day) == day
+
     def _has_listed(self, instrument: str, contract_month: str | None, day: date) -> bool:
         if contract_month is None or instrument not in {"TX", "MTX"}:
             return True
