@@ -11,6 +11,7 @@ from gtts.data.quality import FeatureEvent
 from gtts.data.schema import TAIPEI, SignalEvent
 from gtts.engine.backtest import run_backtest
 from gtts.engine.events import OrderRequest, RollRequest, SettlementEvent, Side
+from gtts.research.comparison import delayed_decision_features, only_delayed_position_decisions
 from gtts.risk.margin import Costs, Margin, Schedules
 
 D = Decimal
@@ -842,6 +843,45 @@ def test_golden_stop_gap_and_same_bar_oco(
         ("stop", expected_ref, expected_ref - 1),
     ]
     assert result.snapshots[-1].equity == D(equity)
+
+
+def test_delayed_strategy_decision_preserves_market_bar_stop_execution(calendar, schedules) -> None:
+    bars = (
+        bar(at(9, 0), 1000),
+        bar(at(9, 5), 1000),
+        bar(at(9, 10), 1000),
+        bar(at(9, 15), 1000, low=980, opening_volume=1),
+    )
+    decisions = delayed_decision_features(bars)
+
+    def decide(feature: FeatureEvent, _positions: Mapping[tuple[str, str], int]):
+        if feature.bar_start == at(9, 0):
+            return [order("delayed_entry", feature.available_at, "buy", stop=990)]
+        return []
+
+    normal = run_backtest(
+        calendar,
+        schedules,
+        D(10000),
+        bars,
+        on_feature_with_positions=decide,
+    )
+    delayed = run_backtest(
+        calendar,
+        schedules,
+        D(10000),
+        bars,
+        decision_features=decisions,
+        on_feature_with_positions=only_delayed_position_decisions(decide, decisions),
+    )
+
+    assert [fill.reason for fill in normal.fills] == ["signal", "stop"]
+    assert [fill.reason for fill in delayed.fills] == ["signal", "stop"]
+    assert normal.fills[0].fill_at == at(9, 5) + timedelta(microseconds=1)
+    assert delayed.fills[0].fill_at == at(9, 10) + timedelta(microseconds=1)
+    assert normal.fills[-1].reference_price == delayed.fills[-1].reference_price == D(990)
+    assert not normal.snapshots[-1].positions
+    assert not delayed.snapshots[-1].positions
 
 
 def test_golden_margin_refusal_and_forced_exit(calendar, schedules) -> None:
