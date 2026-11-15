@@ -28,6 +28,7 @@ from gtts.engine.broker import (
 from gtts.engine.events import BacktestResult, OrderRequest, SettlementEvent, Side
 from gtts.features.institutional import InstitutionalFeature, Scores, institutional_feature
 from gtts.features.volatility import atr14
+from gtts.risk.limits import RiskLimits
 from gtts.risk.margin import Schedules
 
 Variant = Literal["institutional_bayes", "institutional_logistic", "institutional_net", "momentum"]
@@ -514,6 +515,7 @@ def compare_institutional(
             opening_only_bars=opening_only,
             orders=(row.order for row in decisions if row.order is not None),
             settlements=settlements,
+            risk_limits=RiskLimits(),
         )
         for variant, decisions in comparisons.items()
     }
