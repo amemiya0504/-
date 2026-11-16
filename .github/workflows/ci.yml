@@ -4,10 +4,6 @@ on:
   push:
   pull_request:
 
-defaults:
-  run:
-    working-directory: 賽局理論
-
 jobs:
   offline-quality:
     runs-on: ubuntu-latest
