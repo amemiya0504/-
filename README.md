@@ -7,15 +7,36 @@
 需要 Python 3.12 與 uv。首次安裝需可取得 Python 套件；之後測試與 smoke 不呼叫外部資料服務。
 
 ```powershell
-uv sync
-uv run pytest
-uv run ruff check .
-uv run mypy src
-uv run python scripts/run_smoke.py
-uv run python scripts/ingest_daily.py --dry-run
+uv sync --extra dashboard
+uv run --extra dashboard coverage run --branch --source=src/gtts/engine,src/gtts/data,src/gtts/risk -m pytest
+uv run coverage json -o coverage.json
+uv run python scripts/check_branch_coverage.py coverage.json
+uv run --extra dashboard ruff check .
+uv run --extra dashboard mypy src
+uv run --extra dashboard python scripts/run_smoke.py
+uv run --extra dashboard python scripts/ingest_daily.py --dry-run
 ```
 
 `--dry-run` 使用 2026-11-13 的合成 fixture，列出筆數與資料缺口，不連網、不寫檔。有缺口時回傳結束碼 `1`。交易所休市日回傳零筆，超出日曆覆蓋範圍則回報缺口。
+
+## 唯讀研究儀表板
+
+Clone 後，在專案目錄執行以下命令安裝、測試並重跑合成 fixture；安裝套件需網路，測試與 demo 不連線外部資料服務：
+
+```powershell
+uv sync --extra dashboard
+uv run --extra dashboard pytest
+uv run --extra dashboard python scripts/demo_dashboard.py
+```
+
+Demo 每次在 `runs/` 建立新的 synthetic run，保留原始輸入與 PR-09 報告。分別在兩個終端啟動：
+
+```powershell
+uv run --extra dashboard uvicorn gtts.api.main:app --host 127.0.0.1 --port 8000
+uv run --extra dashboard streamlit run src/gtts/dashboard/app.py --server.address 127.0.0.1
+```
+
+開啟 http://127.0.0.1:8501。或先產生 demo 後執行 `docker compose up --build`；服務只綁定本機，API 對 `runs` 採唯讀掛載。每個 run 目錄須包含 `input.json`（`generate_report.py` 的輸入）及 `report.json`（其輸出）；可在輸入提供 `features`、`rolls` 與 `data_gaps` 陣列。缺少資料時畫面標示缺口，外部交易 ledger 未經逐筆對帳。輸入資料必須自行移除敏感資訊，此本機服務沒有登入機制。
 
 ## 日資料擷取
 
@@ -31,6 +52,12 @@ uv run python scripts/ingest_daily.py --live --date 2026-11-13 --database data/g
 
 S1 的資料、校準、成本與退出規則見 [S1 法人貝氏訊號](docs/backtest_protocol.md#s1-法人貝氏訊號)。可跑 `uv run pytest tests/unit/test_institutional.py` 重現合成資料的 OOS 流程。
 
-Fubon 歷史 K 線端點自 SDK v2.4.0 起提供；adapter 使用呼叫端注入的 client，未安裝、登入或連線 SDK。SDK 回補資料只標示首次擷取時間，現有 fixture 與策略測試都是合成資料，尚未建立真實績效。S2 的公式、資料時點與限制見 [S2 同步基差回歸](docs/backtest_protocol.md#s2-同步基差回歸)。
+Fubon 歷史 K 線端點自 SDK v2.4.0 起提供。用 `uv sync --extra fubon` 安裝選配 SDK 後，可執行下列唯讀擷取命令；執行時會隱藏詢問登入資訊，並把指定月契約的單一交易日 5 分 K 存成新的 JSONL 快照：
+
+```powershell
+uv run --extra fubon python scripts/ingest_fubon.py --date 2026-11-13 --contract-month 202611 --product TXF --session regular --certificate D:\fadacai\fbs\your-certificate.p12
+```
+
+本機 `D:\fadacai\fbs` 的 2.2.8 wheel 不含期貨歷史 K 線端點。擷取資料只標示 API 首次回傳時間，沒有歷史發布時間或可核證的開盤事件；可供收盤後研究，不能證明原始 K 棒開盤時已可用。現有 fixture 與策略測試仍是合成資料，尚未建立真實績效。S2 的公式、資料時點與限制見 [S2 同步基差回歸](docs/backtest_protocol.md#s2-同步基差回歸)。
 
 S3 使用前 20 個完整日盤估計波動分位數與同時段量能 z-score，只在高波動且放量突破時入場；其 Donchian baseline 不套這兩個篩選，但沿用相同風險、成本及退出規則。兩者資料需求、收盤訊號至下一開盤成交、到期拒單與合成資料限制見 [S3 波動狀態突破](docs/backtest_protocol.md#s3-波動狀態突破)。

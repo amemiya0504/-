@@ -1,0 +1,12 @@
+{
+  "name": "synthetic-demo",
+  "baseline_name": "synthetic-baseline",
+  "evaluation_period": "oos",
+  "initial_equity": "100000",
+  "backtest_result": {"orders": [], "fills": [], "snapshots": [], "settlements": [], "audit": []},
+  "daily_equity": [{"date": "2026-01-01", "equity": "100000"}, {"date": "2026-01-02", "equity": "100000"}],
+  "baseline_daily_equity": [{"date": "2026-01-01", "equity": "100000"}, {"date": "2026-01-02", "equity": "100000"}],
+  "features": [{"source_id": "synthetic", "confidence": null, "reason": "示範資料，未產生訊號", "published_at": "2026-01-01T15:00:00+08:00", "available_at": "2026-01-02T09:00:00+08:00"}],
+  "data_gaps": ["合成 fixture；沒有授權的歷史資料"],
+  "limitations": ["合成資料，僅供離線介面示範；樣本不足，研究未證實。"]
+}

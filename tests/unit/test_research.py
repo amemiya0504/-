@@ -5,7 +5,7 @@ import subprocess
 import sys
 import tempfile
 from datetime import date, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from pathlib import Path
 from random import Random
 from typing import Literal, Self
@@ -176,6 +176,7 @@ def test_metrics_reconcile_fill_and_settlement_costs_and_completed_trades() -> N
             gross_pnl=Decimal(1000),
             net_pnl=Decimal(980),
             costs=Decimal(20),
+            contract_month="202611",
         ),
         CompletedTrade(
             trade_id="trade-2",
@@ -186,6 +187,7 @@ def test_metrics_reconcile_fill_and_settlement_costs_and_completed_trades() -> N
             net_pnl=Decimal(-520),
             costs=Decimal(20),
             roll=True,
+            contract_month="202612",
         ),
     )
     metrics = calculate_metrics(
@@ -203,6 +205,9 @@ def test_metrics_reconcile_fill_and_settlement_costs_and_completed_trades() -> N
     assert metrics.tax == Decimal(7)
     assert metrics.slippage == Decimal(3)
     assert metrics.net_pnl == Decimal(5)
+    assert metrics.traded_notional == Decimal(20000)
+    assert metrics.turnover_ratio == pytest.approx(20000 / (300050 / 3))
+    assert metrics.cost_to_gross_pnl == pytest.approx(25 / 30)
     assert metrics.fill_count == 4
     assert metrics.trade_count == 2
     assert metrics.profit_factor == pytest.approx(980 / 520)
@@ -211,6 +216,8 @@ def test_metrics_reconcile_fill_and_settlement_costs_and_completed_trades() -> N
     assert metrics.trade_ledger_status == "unverified_external"
     assert metrics.slices["session:night"]["trade_count"] == 1
     assert metrics.slices["roll:true"]["net_pnl"] == "-520"
+    assert metrics.slices["month:2026-11"]["trade_count"] == 2
+    assert metrics.slices["contract_month:202612"]["net_pnl"] == "-520"
 
 
 def test_metrics_leave_return_metrics_unavailable_without_daily_equity() -> None:
@@ -224,8 +231,218 @@ def test_metrics_leave_return_metrics_unavailable_without_daily_equity() -> None
     assert metrics.cagr is None
     assert metrics.max_drawdown is None
     assert metrics.trade_count is None
+    assert metrics.turnover_ratio is None
     assert metrics.profit_factor is None
     assert zero_trade_metrics.trade_count == 0
+
+
+def test_metrics_leave_cost_ratio_undefined_when_gross_pnl_is_not_positive() -> None:
+    fill = _position_fill("loss", date(2026, 1, 1), 30, "buy", gross_pnl=Decimal(-1))
+    metrics = calculate_metrics(
+        _empty_result(fills=(fill,)),
+        initial_equity=Decimal(1000),
+        daily_equity=((date(2026, 1, 1), Decimal(1000)),),
+    )
+
+    assert metrics.gross_pnl == Decimal(-1)
+    assert metrics.cost_to_gross_pnl is None
+    assert metrics.turnover_ratio == pytest.approx(5000 / 1000)
+
+
+def test_metric_ratios_ignore_external_decimal_precision() -> None:
+    fill = _position_fill("precision", date(2026, 1, 1), 30, "buy", gross_pnl=Decimal(3))
+    fill = BacktestFill.model_validate(fill.model_dump() | {"broker_fee": Decimal(1)})
+    kwargs = {
+        "initial_equity": Decimal(1000),
+        "daily_equity": ((date(2026, 1, 1), Decimal(2000)),),
+    }
+    with localcontext() as context:
+        context.prec = 4
+        low_precision = calculate_metrics(_empty_result(fills=(fill,)), **kwargs)
+    with localcontext() as context:
+        context.prec = 28
+        high_precision = calculate_metrics(_empty_result(fills=(fill,)), **kwargs)
+
+    assert low_precision.turnover_ratio == high_precision.turnover_ratio
+    assert low_precision.cost_to_gross_pnl == high_precision.cost_to_gross_pnl
+
+
+def test_metric_ratios_return_null_when_decimal_values_overflow() -> None:
+    tiny = Decimal("1e-999999")
+    tiny_equity = calculate_metrics(
+        _empty_result(fills=(_position_fill("tiny-equity", date(2026, 1, 1), 30, "buy"),)),
+        initial_equity=tiny,
+        daily_equity=((date(2026, 1, 1), tiny),),
+    )
+    huge_cost_fill = _position_fill(
+        "huge-cost", date(2026, 1, 1), 30, "buy", gross_pnl=tiny
+    )
+    huge_cost_fill = BacktestFill.model_validate(
+        huge_cost_fill.model_dump() | {"broker_fee": Decimal("1e999999")}
+    )
+    huge_cost = calculate_metrics(
+        _empty_result(fills=(huge_cost_fill,)),
+        initial_equity=Decimal(1000),
+        daily_equity=((date(2026, 1, 1), Decimal(1000)),),
+    )
+
+    assert tiny_equity.turnover_ratio is None
+    assert huge_cost.cost_to_gross_pnl is None
+
+
+@pytest.mark.parametrize(
+    ("initial", "daily"),
+    [
+        (Decimal(1000), (Decimal("-9e999999"), Decimal("-9e999999"))),
+        (Decimal("9e999999"), (Decimal("9e999999"), Decimal("9e999999"))),
+    ],
+)
+def test_turnover_overflow_does_not_abort_report(
+    initial: Decimal, daily: tuple[Decimal, Decimal]
+) -> None:
+    metrics = calculate_metrics(
+        _empty_result(),
+        initial_equity=initial,
+        daily_equity=(
+            (date(2026, 1, 1), daily[0]),
+            (date(2026, 1, 2), daily[1]),
+        ),
+    )
+
+    assert metrics.turnover_ratio is None
+
+
+def test_traded_notional_overflow_does_not_abort_report() -> None:
+    fill = _position_fill("huge-price", date(2026, 1, 1), 30, "buy")
+    fill = BacktestFill.model_validate(
+        fill.model_dump() | {"price": Decimal("9e999999"), "multiplier": 50}
+    )
+
+    metrics = calculate_metrics(_empty_result(fills=(fill,)), initial_equity=Decimal(1000))
+
+    assert metrics.traded_notional is None
+    assert metrics.turnover_ratio is None
+
+
+def test_completed_trade_validates_calendar_and_weekly_contract_month() -> None:
+    with pytest.raises(ValueError, match="contract_month must be YYYYMM"):
+        CompletedTrade(
+            trade_id="bad-month",
+            entry_trade_date=date(2026, 1, 1),
+            trade_date=date(2026, 1, 1),
+            session="day",
+            gross_pnl=Decimal(0),
+            net_pnl=Decimal(0),
+            costs=Decimal(0),
+            contract_month="202613",
+        )
+    weekly = CompletedTrade(
+        trade_id="weekly-month",
+        entry_trade_date=date(2026, 1, 1),
+        trade_date=date(2026, 1, 1),
+        session="day",
+        gross_pnl=Decimal(0),
+        net_pnl=Decimal(0),
+        costs=Decimal(0),
+        contract_month="202602W2",
+    )
+    assert weekly.contract_month == "202602W2"
+
+
+def test_backtest_fill_rejects_non_positive_multiplier() -> None:
+    fill = _position_fill("bad-multiplier", date(2026, 1, 1), 30, "buy")
+
+    for multiplier in (0, -50):
+        with pytest.raises(ValueError, match="greater than 0"):
+            BacktestFill.model_validate(fill.model_dump() | {"multiplier": multiplier})
+
+
+def test_report_trade_parser_preserves_optional_contract_month() -> None:
+    trades = generate_report._trade_rows(
+        {
+            "completed_trades": [
+                {
+                    "trade_id": "trade-1",
+                    "entry_trade_date": "2026-01-01",
+                    "trade_date": "2026-01-02",
+                    "session": "day",
+                    "gross_pnl": "1",
+                    "net_pnl": "1",
+                    "costs": "0",
+                    "contract_month": "202602",
+                }
+            ]
+        }
+    )
+
+    assert trades is not None
+    assert trades[0].contract_month == "202602"
+
+
+def test_report_marks_missing_contract_month_slice(tmp_path: Path) -> None:
+    project = Path(__file__).resolve().parents[2]
+    input_path = tmp_path / "input.json"
+    output_path = tmp_path / "report.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "initial_equity": "1000",
+                "backtest_result": _empty_result().model_dump(mode="json"),
+                "completed_trades": [
+                    {
+                        "trade_id": "trade-1",
+                        "entry_trade_date": "2026-01-01",
+                        "trade_date": "2026-01-02",
+                        "session": "day",
+                        "gross_pnl": "1",
+                        "net_pnl": "1",
+                        "costs": "0",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    subprocess.run(
+        (
+            sys.executable,
+            str(project / "scripts" / "generate_report.py"),
+            "--input",
+            str(input_path),
+            "--output",
+            str(output_path),
+        ),
+        check=True,
+        capture_output=True,
+        cwd=project,
+        text=True,
+    )
+
+    report = json.loads(output_path.read_bytes())
+    assert "contract_month:202601" not in report["metrics"]["slices"]
+    assert any("契約月份切片不完整" in message for message in report["limitations"])
+
+
+@pytest.mark.parametrize(("covered", "expected"), [(90, 0), (89, 1), (101, 2)])
+def test_branch_coverage_gate_enforces_core_threshold(
+    tmp_path: Path, covered: int, expected: int
+) -> None:
+    project = Path(__file__).resolve().parents[2]
+    report = tmp_path / "coverage.json"
+    report.write_text(
+        json.dumps({"totals": {"covered_branches": covered, "num_branches": 100}}),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        (sys.executable, str(project / "scripts" / "check_branch_coverage.py"), str(report)),
+        check=False,
+        capture_output=True,
+        cwd=project,
+        text=True,
+    )
+
+    assert result.returncode == expected
 
 
 def test_metrics_reject_duplicate_completed_trade_ids() -> None:
@@ -677,6 +894,7 @@ def test_report_cli_marks_missing_research_inputs_and_refuses_overwrite(tmp_path
     assert report["claim_status"] == "未證實"
     assert report["metrics"]["trade_count"] is None
     assert any("未提供完整日終權益" in message for message in report["limitations"])
+    assert any("重大行情時間區間" in message for message in report["limitations"])
 
     blocked = subprocess.run(command, check=False, capture_output=True, cwd=project, text=True)
     assert blocked.returncode != 0

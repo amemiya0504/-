@@ -126,6 +126,101 @@ def test_risk_defaults_and_point_value_stop_calculation() -> None:
     assert stop_loss_amount(D(1001), D(991), 1, 200) == D(2000)
 
 
+@pytest.mark.parametrize(
+    ("entry", "distance", "tick"),
+    [(D(0), D(1), D(1)), (D(10), D(0), D(1)), (D(10), D(1), D(0))],
+)
+def test_stop_distance_rejects_non_positive_inputs(
+    entry: Decimal, distance: Decimal, tick: Decimal
+) -> None:
+    with pytest.raises(ValueError, match="must be positive"):
+        stop_from_distance(entry, "buy", distance, tick)
+
+
+def test_stop_distance_rejects_stop_at_or_below_zero() -> None:
+    with pytest.raises(ValueError, match="stop must be positive"):
+        stop_from_distance(D(1), "buy", D(1), D(1))
+
+
+@pytest.mark.parametrize(
+    ("entry", "stop", "quantity", "multiplier"),
+    [(D(0), D(1), 1, 1), (D(1), D(0), 1, 1), (D(1), D(1), 0, 1)],
+)
+def test_stop_loss_rejects_invalid_risk_inputs(
+    entry: Decimal, stop: Decimal, quantity: int, multiplier: int
+) -> None:
+    with pytest.raises(ValueError, match="must be positive"):
+        stop_loss_amount(entry, stop, quantity, multiplier)
+
+
+def test_order_request_rejects_conflicting_or_misordered_brackets() -> None:
+    decision = datetime(2026, 12, 1, 9, tzinfo=TAIPEI)
+    signal = SignalEvent(
+        signal_id="validation",
+        strategy_id="validation",
+        instrument_id="MTX",
+        side="buy",
+        decision_at=decision,
+        available_at=decision,
+    )
+    common = {"signal": signal, "contract_month": MONTH, "quantity": 1}
+    invalid = [
+        {**common, "reduce_only": True, "stop_price": D(990)},
+        {**common, "stop_price": D(990), "stop_distance": D(10)},
+        {**common, "target_price": D(1020), "target_distance": D(20)},
+        {**common, "stop_price": D(1010), "target_price": D(1000)},
+        {**common, "exit_at": decision},
+    ]
+
+    for values in invalid:
+        with pytest.raises(ValueError):
+            OrderRequest(**values)
+
+
+def test_order_request_validates_short_bracket_and_roll_months() -> None:
+    decision = datetime(2026, 12, 1, 9, tzinfo=TAIPEI)
+    signal = SignalEvent(
+        signal_id="short-validation",
+        strategy_id="short-validation",
+        instrument_id="MTX",
+        side="sell",
+        decision_at=decision,
+        available_at=decision,
+    )
+    valid = OrderRequest(
+        signal=signal,
+        contract_month=MONTH,
+        quantity=1,
+        stop_price=D(1010),
+        target_price=D(990),
+    )
+    assert valid.stop_price == D(1010)
+    with pytest.raises(ValueError, match="distinct contracts"):
+        RollRequest(
+            signal=signal,
+            from_contract_month=MONTH,
+            to_contract_month=MONTH,
+            quantity=1,
+        )
+
+
+def test_margin_schedule_rejects_unsafe_levels_and_duplicate_dates() -> None:
+    with pytest.raises(ValueError, match="maintenance margin must not exceed initial"):
+        Margin(
+            effective_from=datetime(2026, 1, 1, tzinfo=TAIPEI),
+            initial=D(10000),
+            maintenance=D(10001),
+        )
+    term = Costs(
+        effective_from=date(2026, 1, 1),
+        broker_fee_per_contract=D(1),
+        tax_rate=D(0),
+        slippage_ticks=1,
+    )
+    with pytest.raises(ValueError, match="effective dates must be unique and sorted"):
+        Schedules(costs={"MTX": (term, term)}, margins={})
+
+
 def test_entry_slippage_is_not_counted_twice_in_stop_budget(calendar, schedules) -> None:
     start = datetime.combine(TODAY, time(9), TAIPEI)
     bars = [make_bar(start), make_bar(start + timedelta(minutes=5))]
