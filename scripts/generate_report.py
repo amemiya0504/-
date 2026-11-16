@@ -49,6 +49,7 @@ def _trade_rows(payload: dict[str, object]) -> tuple[CompletedTrade, ...] | None
             net_pnl=_decimal(row["net_pnl"]),
             costs=_decimal(row["costs"]),
             roll=cast(bool, row.get("roll", False)),
+            contract_month=cast(str | None, row.get("contract_month")),
         )
         for row in rows
     )
@@ -293,7 +294,7 @@ def main() -> int:
         )
     if trades is None:
         cast(list[str], report["limitations"]).append(
-            "未提供配對完成交易，Profit Factor、勝率、交易數與年度／日夜盤／換月切片不計算。"
+            "未提供配對完成交易，Profit Factor、勝率、交易數與年度／月份／日夜盤／契約月份／換月切片不計算。"
         )
     elif not trades:
         cast(list[str], report["limitations"]).append(
@@ -303,6 +304,13 @@ def main() -> int:
         cast(list[str], report["limitations"]).append(
             "外部 CompletedTrade ledger 未逐筆與回測成交／結算對帳，交易層級統計與切片未核證。"
         )
+        if any(trade.contract_month is None for trade in trades):
+            cast(list[str], report["limitations"]).append(
+                "CompletedTrade ledger 有列缺少 contract_month，契約月份切片不完整。"
+            )
+    cast(list[str], report["limitations"]).append(
+        "尚未提供重大行情時間區間，未產生該類 OOS 切片。"
+    )
     if manifest["code_dirty"] is True:
         cast(list[str], report["limitations"]).append(
             "產生報告時研究程式有未提交變更，僅靠 commit 無法重現此結果。"

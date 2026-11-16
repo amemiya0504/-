@@ -8,7 +8,9 @@
 
 ```powershell
 uv sync --extra dashboard
-uv run --extra dashboard pytest
+uv run --extra dashboard coverage run --branch --source=src/gtts/engine,src/gtts/data,src/gtts/risk -m pytest
+uv run coverage json -o coverage.json
+uv run python scripts/check_branch_coverage.py coverage.json
 uv run --extra dashboard ruff check .
 uv run --extra dashboard mypy src
 uv run --extra dashboard python scripts/run_smoke.py

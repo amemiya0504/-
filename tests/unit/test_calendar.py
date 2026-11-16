@@ -112,3 +112,44 @@ def test_session_at_distinguishes_break_from_night_at_end_of_coverage(
     assert calendar.session_at("TX", datetime(2026, 12, 31, 14, tzinfo=TAIPEI)) is None
     with pytest.raises(CalendarGap, match="coverage missing"):
         calendar.session_at("TX", datetime(2026, 12, 31, 15, tzinfo=TAIPEI))
+
+
+@pytest.mark.parametrize(
+    "changes, message",
+    [
+        ({"covered_from": date(2026, 12, 31), "covered_through": date(2026, 1, 1)}, "reversed"),
+        ({"cash_close": time(13, tzinfo=TAIPEI)}, "cash_close must be a local"),
+        (
+            {"closed_dates": {date(2026, 1, 1)}, "extra_open_dates": {date(2026, 1, 1)}},
+            "both open and closed",
+        ),
+        ({"closed_dates": {date(2025, 12, 31)}}, "coverage missing"),
+        (
+            {"expiry_overrides": {"UNKNOWN": {"202611": date(2026, 11, 13)}}},
+            "unknown expiry",
+        ),
+    ],
+)
+def test_calendar_rejects_unsafe_configuration(
+    calendar: TradingCalendar, changes: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        TradingCalendar.model_validate(calendar.model_dump() | changes)
+
+
+@pytest.mark.parametrize(
+    "changes, message",
+    [
+        ({"night_open": None}, "set together"),
+        ({"night_open": time(12), "night_close": time(4)}, "cross midnight"),
+        ({"expiry_close": time(14)}, "day_open < expiry_close"),
+        ({"day_open": time(8, tzinfo=TAIPEI)}, "local wall-clock"),
+    ],
+)
+def test_contract_rejects_invalid_hours(
+    calendar: TradingCalendar, changes: dict[str, object], message: str
+) -> None:
+    values = calendar.model_dump()
+    values["contracts"]["TX"] = (values["contracts"]["TX"][0] | changes,)
+    with pytest.raises(ValueError, match=message):
+        TradingCalendar.model_validate(values)

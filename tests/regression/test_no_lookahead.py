@@ -1,4 +1,4 @@
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -518,3 +518,44 @@ def test_default_audit_current_view_keeps_only_latest_revision(calendar) -> None
 def test_audit_rejects_naive_decision_at(calendar) -> None:
     with pytest.raises(ValueError, match="Asia/Taipei"):
         audit_observations([], calendar, decision_at=datetime(2026, 11, 17, 9))
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"bar_end": datetime(2026, 11, 13, 10, 1, tzinfo=TAIPEI)}, "exactly five minutes"),
+        ({"open_price_available_at": datetime(2026, 11, 13, 9, 56, tzinfo=TAIPEI)}, "open price must"),
+        ({"open_volume_available_at": datetime(2026, 11, 13, 9, 56, tzinfo=TAIPEI)}, "open volume must"),
+        ({"open_volume": -1}, "greater than or equal to 0"),
+        ({"bar_start": datetime(2026, 11, 13, 1, tzinfo=UTC)}, "Asia/Taipei"),
+    ],
+)
+def test_feature_event_rejects_invalid_times_and_values(overrides, message) -> None:
+    values = {
+        "instrument_id": "TX",
+        "trade_date": date(2026, 11, 13),
+        "session": "day",
+        "bar_start": datetime(2026, 11, 13, 9, 55, tzinfo=TAIPEI),
+        "bar_end": datetime(2026, 11, 13, 10, tzinfo=TAIPEI),
+        "available_at": datetime(2026, 11, 13, 10, tzinfo=TAIPEI),
+    }
+    with pytest.raises(ValidationError, match=message):
+        FeatureEvent(**(values | overrides))
+
+
+def test_point_in_time_join_rejects_non_taipei_decision(calendar: TradingCalendar) -> None:
+    with pytest.raises(ValueError, match="Asia/Taipei"):
+        point_in_time_join([], datetime(2026, 11, 17, 1, tzinfo=UTC), calendar)
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"max_price_change": Decimal("-0.1")}, "non-negative"),
+        ({"interval": timedelta(0)}, "interval must be positive"),
+        ({"decision_at": datetime(2026, 11, 17, 1)}, "Asia/Taipei"),
+    ],
+)
+def test_audit_rejects_invalid_safety_limits(calendar: TradingCalendar, kwargs, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        audit_observations([], calendar, **kwargs)

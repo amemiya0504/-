@@ -16,7 +16,9 @@ jobs:
         with:
           python-version: "3.12"
       - run: uv sync --locked --extra dashboard
-      - run: uv run --extra dashboard pytest
+      - run: uv run --extra dashboard coverage run --branch --source=src/gtts/engine,src/gtts/data,src/gtts/risk -m pytest
+      - run: uv run coverage json -o coverage.json
+      - run: uv run python scripts/check_branch_coverage.py coverage.json
       - run: uv run --extra dashboard ruff check .
       - run: uv run --extra dashboard mypy src
       - run: uv run --extra dashboard python scripts/run_smoke.py

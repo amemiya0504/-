@@ -1,5 +1,6 @@
 """Metrics that only use explicitly supplied daily and completed-trade observations."""
 
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -24,6 +25,7 @@ class CompletedTrade:
     net_pnl: Decimal
     costs: Decimal
     roll: bool = False
+    contract_month: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.trade_id, str) or not self.trade_id.strip():
@@ -32,6 +34,11 @@ class CompletedTrade:
             raise ValueError("session must be day or night")
         if type(self.roll) is not bool:
             raise ValueError("roll must be a boolean")
+        if self.contract_month is not None and (
+            not isinstance(self.contract_month, str)
+            or not re.fullmatch(r"\d{4}(0[1-9]|1[0-2])(?:W[1245])?", self.contract_month)
+        ):
+            raise ValueError("contract_month must be YYYYMM or listed YYYYMMWn when provided")
         if self.entry_trade_date > self.trade_date:
             raise ValueError("a completed trade must exit on or after its entry trade date")
         amounts = (self.gross_pnl, self.net_pnl, self.costs)
@@ -56,6 +63,9 @@ class ResearchMetrics:
     tax: Decimal
     slippage: Decimal
     total_cost: Decimal
+    traded_notional: Decimal | None
+    turnover_ratio: float | None
+    cost_to_gross_pnl: float | None
     fill_count: int
     filled_contracts: int
     trade_count: int | None
@@ -144,8 +154,11 @@ def _slices(trades: tuple[CompletedTrade, ...]) -> dict[str, dict[str, str | int
     grouped: dict[str, list[CompletedTrade]] = defaultdict(list)
     for trade in trades:
         grouped[f"year:{trade.trade_date.year}"].append(trade)
+        grouped[f"month:{trade.trade_date:%Y-%m}"].append(trade)
         grouped[f"session:{trade.session}"].append(trade)
         grouped[f"roll:{str(trade.roll).lower()}"].append(trade)
+        if trade.contract_month is not None:
+            grouped[f"contract_month:{trade.contract_month}"].append(trade)
     with localcontext(Context(prec=50)):
         return {
             key: {
@@ -168,6 +181,7 @@ def calculate_metrics(
 ) -> ResearchMetrics:
     """Summarize a backtest; annualized metrics require a verified daily equity series."""
     daily = _validate_daily_equity(daily_equity, initial_equity)
+    equity_path = (initial_equity,) + tuple(equity for _, equity in daily)
     trades = completed_trades or ()
     _validate_unique_fills(result)
     settlement_ids = tuple(
@@ -218,8 +232,30 @@ def calculate_metrics(
         costs = broker_fee + tax + slippage
         gross = realized_gross + unrealized
         net = gross - costs
+        try:
+            traded_notional = sum(
+                (abs(fill.price) * fill.multiplier * fill.quantity for fill in result.fills), ZERO
+            )
+        except ArithmeticError:
+            traded_notional = None
 
-    equity_path = (initial_equity,) + tuple(equity for _, equity in daily)
+    turnover_ratio = None
+    cost_to_gross = None
+    with localcontext(Context(prec=50)):
+        if traded_notional is not None and daily and all(equity > ZERO for equity in equity_path):
+            try:
+                average_equity = sum(equity_path, ZERO) / len(equity_path)
+                candidate_turnover = float(traded_notional / average_equity)
+            except ArithmeticError:
+                candidate_turnover = float("inf")
+            turnover_ratio = candidate_turnover if isfinite(candidate_turnover) else None
+        if gross > ZERO:
+            try:
+                candidate_cost_ratio = float(costs / gross)
+            except ArithmeticError:
+                candidate_cost_ratio = float("inf")
+            cost_to_gross = candidate_cost_ratio if isfinite(candidate_cost_ratio) else None
+
     peak = equity_path[0]
     max_drawdown_ratio = ZERO
     for equity in equity_path[1:]:
@@ -305,6 +341,9 @@ def calculate_metrics(
         tax=tax,
         slippage=slippage,
         total_cost=costs,
+        traded_notional=traded_notional,
+        turnover_ratio=turnover_ratio,
+        cost_to_gross_pnl=cost_to_gross,
         fill_count=len(result.fills),
         filled_contracts=sum(fill.quantity for fill in result.fills),
         trade_count=len(trades) if completed_trades is not None else None,

@@ -97,7 +97,7 @@ class BacktestFill(FillEvent):
     contract_month: str
     trade_date: date
     reason: Reason
-    multiplier: int
+    multiplier: int = Field(gt=0, strict=True)
     reference_price: Decimal
     gross_pnl: Decimal
     broker_fee: Decimal

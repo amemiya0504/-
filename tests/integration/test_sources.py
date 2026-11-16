@@ -30,6 +30,17 @@ def fixture(source_id: str) -> bytes:
     return (Path(__file__).parents[1] / "fixtures" / "sources" / f"{source_id}.json").read_bytes()
 
 
+def ingest_row(adapter, row: dict[str, str]):
+    return ingest_daily(
+        TRADE_DATE,
+        calendar(),
+        [adapter],
+        None,
+        fetch=lambda *_: (json.dumps([row]).encode(), None),
+        now=lambda: FETCHED,
+    )
+
+
 def test_sources_normalize_offline_and_reuse_cached_raw(tmp_path: Path) -> None:
     database = tmp_path / "ingest.sqlite"
     payloads = {adapter.endpoint: fixture(adapter.source_id) for adapter in ADAPTERS}
@@ -171,3 +182,140 @@ def test_off_scope_date_and_corrupted_cache_are_visible(tmp_path: Path) -> None:
         refresh=True,
     )
     assert repaired.records and repaired.gaps == []
+
+
+@pytest.mark.parametrize("timeout, attempts", [(0, 1), (-1, 1), (float("inf"), 1), (1, 0)])
+def test_ingest_rejects_invalid_retry_settings(timeout: float, attempts: int) -> None:
+    with pytest.raises(ValueError, match="timeout and attempts must be positive"):
+        ingest_daily(TRADE_DATE, calendar(), [TwseIndex()], None, timeout=timeout, attempts=attempts)
+
+
+def test_non_trade_date_skips_fetch() -> None:
+    fetch = Mock()
+    result = ingest_daily(date(2026, 11, 14), calendar(), [TwseIndex()], None, fetch=fetch)
+    assert result.records == result.gaps == []
+    fetch.assert_not_called()
+
+
+def test_transient_http_errors_retry_then_report_fetch_gap(monkeypatch: pytest.MonkeyPatch) -> None:
+    waits: list[float] = []
+    monkeypatch.setattr("gtts.data.ingest.sleep", waits.append)
+    fetch = Mock(side_effect=HTTPError("https://unused.test", 503, "busy", {}, None))
+    result = ingest_daily(TRADE_DATE, calendar(), [TwseIndex()], None, fetch=fetch, attempts=2)
+    assert fetch.call_count == 2
+    assert waits == [0.25]
+    assert [(gap.kind, gap.detail) for gap in result.gaps] == [("fetch", "HTTP 503")]
+
+
+def test_ingest_rejects_naive_clock() -> None:
+    with pytest.raises(ValueError, match="timezone-aware"):
+        ingest_daily(
+            TRADE_DATE,
+            calendar(),
+            [TwseIndex()],
+            None,
+            fetch=lambda *_: (fixture("twse-index"), None),
+            now=lambda: datetime(2026, 11, 13, 18),
+        )
+
+
+@pytest.mark.parametrize(
+    "changes, kind, detail",
+    [
+        ({"Contract": "UNKNOWN"}, "missing", None),
+        ({"ContractMonth(Week)": "202611/202612"}, "missing", None),
+        ({"TradingSession": "未知"}, "invalid", "unknown TAIFEX session"),
+        ({"Volume": "-1"}, "invalid", "negative count"),
+    ],
+)
+def test_taifex_futures_skips_or_rejects_unsupported_rows(
+    changes: dict[str, str], kind: str, detail: str | None
+) -> None:
+    row = next(
+        row for row in json.loads(fixture("taifex-futures")) if row["Date"] == "20261113"
+    ) | changes
+    result = ingest_row(TaifexFutures(), row)
+    assert result.records == []
+    gaps = [gap for gap in result.gaps if gap.kind == kind]
+    assert gaps
+    if detail is not None:
+        assert detail in gaps[0].detail
+
+
+def test_taifex_futures_rejects_expired_contract_and_empty_market_values() -> None:
+    source_row = next(
+        row for row in json.loads(fixture("taifex-futures")) if row["Date"] == "20261113"
+    )
+    expired = ingest_row(
+        TaifexFutures(), source_row | {"ContractMonth(Week)": "202610"}
+    )
+    assert any("no day session" in gap.detail for gap in expired.gaps)
+
+    empty_values = source_row | {
+        "Open": "-",
+        "High": "-",
+        "Low": "-",
+        "Last": "-",
+        "Volume": "-",
+        "SettlementPrice": "-",
+        "OpenInterest": "-",
+    }
+    empty = ingest_row(TaifexFutures(), empty_values)
+    assert any("no market values" in gap.detail for gap in empty.gaps)
+
+
+def test_taifex_missing_rows_omits_expiry_night_sessions() -> None:
+    missing = TaifexFutures().missing([], date(2026, 11, 14), calendar())
+
+    assert len(missing) == 2
+    assert all("night" not in item for item in missing)
+
+
+@pytest.mark.parametrize(
+    "changes, kind, detail",
+    [
+        ({"ContractCode": "UNKNOWN"}, "missing", None),
+        ({"Item": "未知法人"}, "invalid", "unknown TAIFEX participant"),
+    ],
+)
+def test_taifex_institutional_skips_or_rejects_unsupported_rows(
+    changes: dict[str, str], kind: str, detail: str | None
+) -> None:
+    row = next(
+        row
+        for row in json.loads(fixture("taifex-institutional"))
+        if row["Date"] == "20261113"
+    ) | changes
+    result = ingest_row(TaifexInstitutional(), row)
+    assert result.records == []
+    gaps = [gap for gap in result.gaps if gap.kind == kind]
+    assert gaps
+    if detail is not None:
+        assert detail in gaps[0].detail
+
+
+@pytest.mark.parametrize(
+    "changes, detail",
+    [
+        ({"Date": "1151332"}, "month must be in 1..12"),
+        ({"TradeVolume": "-1"}, "negative TWSE traded shares"),
+    ],
+)
+def test_twse_rejects_invalid_roc_date_or_negative_volume(
+    changes: dict[str, str], detail: str
+) -> None:
+    row = next(
+        row for row in json.loads(fixture("twse-index")) if row["Date"] == "1151113"
+    ) | changes
+    result = ingest_row(TwseIndex(), row)
+    assert result.records == []
+    assert any(gap.kind == "invalid" and detail in gap.detail for gap in result.gaps)
+
+
+def test_twse_rejects_non_roc_date_format() -> None:
+    row = next(
+        row for row in json.loads(fixture("twse-index")) if row["Date"] == "1151113"
+    ) | {"Date": "11511AB"}
+    result = ingest_row(TwseIndex(), row)
+    assert result.records == []
+    assert any("expected a TWSE ROC date" in gap.detail for gap in result.gaps)
