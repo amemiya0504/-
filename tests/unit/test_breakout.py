@@ -11,7 +11,11 @@ from gtts.engine.backtest import run_backtest
 from gtts.engine.broker import executable_bar
 from gtts.features.volatility import atr14, breakout_features, donchian_channel
 from gtts.risk.margin import Costs, Margin, Schedules
-from gtts.strategies.regime_breakout import breakout_order, compare_regime_breakout
+from gtts.strategies.regime_breakout import (
+    atr_breakout_order,
+    breakout_order,
+    compare_regime_breakout,
+)
 
 D = Decimal
 MONTH = "202612"
@@ -404,7 +408,8 @@ def test_same_cost_baseline_replay_has_separate_result(calendar, schedules) -> N
     )
     assert comparison.s3.orders
     assert comparison.donchian_baseline.orders
-    for result in (comparison.s3, comparison.donchian_baseline):
+    assert comparison.atr_baseline.orders
+    for result in (comparison.s3, comparison.donchian_baseline, comparison.atr_baseline):
         order = result.orders[0]
         assert order.order_at == current.available_at
         assert order.side == "buy"
@@ -432,7 +437,7 @@ def test_cutoff_keeps_open_only_evidence_for_late_complete_bar(calendar, schedul
         before=cutoff,
     )
 
-    for result in (comparison.s3, comparison.donchian_baseline):
+    for result in (comparison.s3, comparison.donchian_baseline, comparison.atr_baseline):
         assert result.fills
         assert result.fills[0].fill_at == next_open.bar_start + timedelta(microseconds=1)
 
@@ -467,10 +472,36 @@ def test_retries_after_rejected_open_on_later_breakout(calendar, schedules) -> N
         before=next_open.bar_start + timedelta(microseconds=2),
     )
 
-    for result in (comparison.s3, comparison.donchian_baseline):
+    for result in (comparison.s3, comparison.donchian_baseline, comparison.atr_baseline):
         assert len(result.orders) == 2
         assert [row.code for row in result.audit] == ["insufficient_volume"]
         assert len(result.fills) == 1
         assert result.fills[0].signal_id == (
             f"s3:MTX:{MONTH}:{rejected_open.bar_start.isoformat()}"
         )
+
+
+def test_atr_baseline_enters_on_one_atr_close_move(calendar) -> None:
+    history, current = sample_data(calendar, last_spread=2, current_volume=10)
+    inputs = breakout_features(current, history, calendar)
+    assert inputs is not None and not inputs.high_volatility
+
+    request = atr_breakout_order(current, history, calendar)
+
+    assert request is not None
+    assert request.signal.side == "buy"
+    assert request.signal.strategy_id == "s3_atr_baseline"
+    assert request.stop_distance == inputs.atr * D("1.5")
+    assert request.target_distance == inputs.atr * D(2)
+
+
+def test_atr_baseline_ignores_donchian_breakout_below_one_atr(calendar) -> None:
+    history, current = sample_data(calendar)
+    small = current.model_copy(
+        update={
+            "values": {**current.values, "open": 1000, "high": 1003, "low": 1000, "close": 1002}
+        }
+    )
+    assert breakout_order(small, history, calendar, require_high_volatility=False) is not None
+    assert atr_breakout_order(small, history, calendar) is None
+    assert atr_breakout_order(current, history[:-1], calendar) is None
