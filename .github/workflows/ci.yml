@@ -4,6 +4,10 @@ on:
   push:
   pull_request:
 
+defaults:
+  run:
+    working-directory: 賽局理論
+
 jobs:
   offline-quality:
     runs-on: ubuntu-latest
@@ -15,8 +19,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: uv sync --locked
-      - run: uv run pytest
-      - run: uv run ruff check .
-      - run: uv run mypy src
-      - run: uv run python scripts/run_smoke.py
+      - run: uv sync --locked --extra dashboard
+      - run: uv run --extra dashboard pytest
+      - run: uv run --extra dashboard ruff check .
+      - run: uv run --extra dashboard mypy src
+      - run: uv run --extra dashboard python scripts/run_smoke.py
+      - run: uv run --extra dashboard python scripts/demo_dashboard.py
