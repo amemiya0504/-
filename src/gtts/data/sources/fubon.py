@@ -6,12 +6,13 @@ from collections.abc import Mapping
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
+from pathlib import Path
 from typing import Literal, Protocol
 
 from pydantic import Field, field_validator, model_validator
 
 from gtts.data.calendar import TradingCalendar
-from gtts.data.schema import Schema
+from gtts.data.schema import TAIPEI, Schema
 
 PRODUCTS = {"TXF": "TX", "MXF": "MTX"}
 SESSIONS = {"regular": "REGULAR", "afterhours": "AFTERHOURS"}
@@ -78,6 +79,21 @@ class FubonCandle(Schema):
         return self
 
 
+def save_jsonl(path: Path, candles: list[FubonCandle]) -> None:
+    """Create a new file only; each retrieval is preserved as its own snapshot."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    created = False
+    try:
+        with path.open("x", encoding="utf-8", newline="\n") as output:
+            created = True
+            for candle in candles:
+                output.write(candle.model_dump_json() + "\n")
+    except BaseException:
+        if created:
+            path.unlink(missing_ok=True)
+        raise
+
+
 def _price(value: object, name: str) -> Decimal | None:
     if value is None:
         return None
@@ -107,7 +123,7 @@ class FubonFuturesCandles:
         contract_month: str,
         trade_date: date,
         session: str,
-        ingested_at: datetime,
+        ingested_at: datetime | None = None,
     ) -> list[FubonCandle]:
         if product not in PRODUCTS:
             raise ValueError("product must be TXF or MXF")
@@ -115,6 +131,19 @@ class FubonFuturesCandles:
             raise ValueError("contract_month must be an explicit YYYYMM month")
         if session not in SESSIONS:
             raise ValueError("session must be regular or afterhours")
+        if ingested_at is not None and (
+            ingested_at.tzinfo is None or ingested_at.utcoffset() != timedelta(hours=8)
+        ):
+            raise ValueError("ingested_at must use Asia/Taipei (+08:00)")
+        instrument_id = PRODUCTS[product]
+        expected_session = (
+            self.calendar.day_session(instrument_id, trade_date, contract_month)
+            if session == "regular"
+            else self.calendar.night_session(instrument_id, trade_date, contract_month)
+        )
+        if expected_session is None:
+            raise ValueError("requested session does not exist for the trade date and contract")
+        expected_kind = "day" if session == "regular" else "night"
         response = self.client.candles(
             **{
                 "product": product,
@@ -127,6 +156,7 @@ class FubonFuturesCandles:
                 "sort": "asc",
             }
         )
+        ingested_at = ingested_at or datetime.now(TAIPEI)
         if not isinstance(response, Mapping):
             raise TypeError("Fubon response must be an object")
         if (
@@ -139,9 +169,6 @@ class FubonFuturesCandles:
             or not isinstance(response.get("data"), list)
         ):
             raise ValueError("Fubon response metadata does not match the request")
-        if ingested_at.tzinfo is None or ingested_at.utcoffset() != timedelta(hours=8):
-            raise ValueError("ingested_at must use Asia/Taipei (+08:00)")
-
         provenance = {
             "exchange": "TAIFEX",
             "product": product,
@@ -152,15 +179,6 @@ class FubonFuturesCandles:
             "sort": "asc",
             "availability_assumption": "first_available_at_retrieval",
         }
-        instrument_id = PRODUCTS[product]
-        expected_session = (
-            self.calendar.day_session(instrument_id, trade_date, contract_month)
-            if session == "regular"
-            else self.calendar.night_session(instrument_id, trade_date, contract_month)
-        )
-        if expected_session is None:
-            raise ValueError("requested session does not exist for the trade date and contract")
-        expected_kind = "day" if session == "regular" else "night"
         candles: list[FubonCandle] = []
         previous: datetime | None = None
         for row in response["data"]:
