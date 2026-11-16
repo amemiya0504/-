@@ -1,5 +1,5 @@
 import json
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import cast
@@ -9,7 +9,7 @@ import pytest
 
 from gtts.data.calendar import TradingCalendar
 from gtts.data.schema import TAIPEI
-from gtts.data.sources.fubon import FubonFuturesCandles
+from gtts.data.sources.fubon import FubonCandle, FubonFuturesCandles
 
 TRADE_DATE = date(2026, 11, 13)
 RETRIEVED = datetime(2026, 11, 16, 8, 45, tzinfo=TAIPEI)
@@ -176,3 +176,87 @@ def test_rejects_bad_timestamps_duplicates_and_early_retrieval() -> None:
         FubonFuturesCandles(client, calendar()).read(
             "TXF", "202611", TRADE_DATE, "regular", before_close
         )
+
+def test_null_fubon_price_remains_missing() -> None:
+    response = fixture()
+    rows = response["data"]
+    assert isinstance(rows, list)
+    rows[0]["open"] = None
+    client = Mock(candles=Mock(return_value=response))
+
+    candles = FubonFuturesCandles(client, calendar()).read(
+        "TXF", "202611", TRADE_DATE, "regular", RETRIEVED
+    )
+
+    assert candles[0].open is None
+
+@pytest.mark.parametrize(
+    ("mutate", "error", "message"),
+    [
+        (lambda row: row.__setitem__("volume", True), TypeError, "volume must be an integer"),
+        (lambda row: row.__setitem__("open", True), TypeError, "invalid Fubon open"),
+        (lambda row: row.__setitem__("high", 0), ValueError, "invalid Fubon high"),
+        (lambda row: row.__setitem__("date", 123), TypeError, "missing its raw timestamp"),
+        (lambda row: row.__setitem__("date", "invalid"), ValueError, "invalid Fubon candle timestamp"),
+        (lambda row: row.__setitem__("date", "2026-11-13T09:01:00+08:00"), ValueError, "five-minute boundary"),
+        (lambda row: row.pop("volume"), ValueError, "missing a required candle field"),
+    ],
+)
+def test_rejects_invalid_fubon_rows(mutate, error: type[Exception], message: str) -> None:
+    response = fixture()
+    rows = response["data"]
+    assert isinstance(rows, list)
+    mutate(rows[0])
+    client = Mock(candles=Mock(return_value=response))
+
+    with pytest.raises(error, match=message):
+        FubonFuturesCandles(client, calendar()).read(
+            "TXF", "202611", TRADE_DATE, "regular", RETRIEVED
+        )
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"instrument_id": "MTX"}, "product and instrument_id do not match"),
+        ({"bar_end": datetime(2026, 11, 13, 9, 10, tzinfo=TAIPEI)}, "span five minutes"),
+        ({"available_at": datetime(2026, 11, 16, 8, 46, tzinfo=TAIPEI)}, "at or after retrieval"),
+        ({"high": Decimal(27400)}, "high is below low"),
+        ({"open": Decimal(27600)}, "outside high-low range"),
+        ({"bar_start": datetime(2026, 11, 13, 1, tzinfo=UTC)}, "Asia/Taipei"),
+        ({"close": Decimal(0)}, "finite and positive"),
+    ],
+)
+def test_candle_model_rejects_invalid_evidence(changes: dict[str, object], message: str) -> None:
+    row = FubonFuturesCandles(Mock(candles=Mock(return_value=fixture())), calendar()).read(
+        "TXF", "202611", TRADE_DATE, "regular", RETRIEVED
+    )[0]
+
+    with pytest.raises(ValueError, match=message):
+        FubonCandle.model_validate(row.model_dump() | changes)
+
+def test_rejects_non_object_fubon_response() -> None:
+    client = Mock(candles=Mock(return_value=[]))
+
+    with pytest.raises(TypeError, match="response must be an object"):
+        FubonFuturesCandles(client, calendar()).read(
+            "TXF", "202611", TRADE_DATE, "regular", RETRIEVED
+        )
+
+
+@pytest.mark.parametrize(
+    ("trade_date", "ingested_at", "message"),
+    [
+        (TRADE_DATE, datetime(2026, 11, 13, 9), "ingested_at must use Asia/Taipei"),
+        (date(2026, 11, 15), RETRIEVED, "requested session does not exist"),
+    ],
+)
+def test_rejects_invalid_calendar_or_ingest_time(
+    trade_date: date, ingested_at: datetime, message: str
+) -> None:
+    client = Mock(candles=Mock(return_value=fixture()))
+
+    with pytest.raises(ValueError, match=message):
+        FubonFuturesCandles(client, calendar()).read(
+            "TXF", "202611", trade_date, "regular", ingested_at
+        )
+
